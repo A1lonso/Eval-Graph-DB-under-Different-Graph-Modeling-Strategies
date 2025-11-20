@@ -74,4 +74,5 @@ This implementation builds upon the mgBench framework, leveraging its:
 - Dataset management and indexing automation
 - Result collection and aggregation pipelines
 
-*For details on the original benchmarking tool, see the mgBench documentation and methodology.*
+*For details on the [original benchmarking tool](https://github.com/memgraph/benchgraph.git), see the mgBench documentation and methodology.*
+
