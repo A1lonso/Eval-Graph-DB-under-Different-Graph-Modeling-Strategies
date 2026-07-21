@@ -195,7 +195,6 @@ def parse_args():
 
     return parser.parse_args()
 
-
 def get_queries(gen, count):
     # Make the generator deterministic.
     random.seed(gen.__name__)

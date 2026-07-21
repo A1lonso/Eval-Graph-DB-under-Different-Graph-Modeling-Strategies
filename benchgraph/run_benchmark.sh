@@ -1,27 +1,16 @@
 #!/bin/bash
 
-variants=("research_base_opt" "research_denormalized_opt" "research_intermediate_opt" "research_transitive_opt" "research_uplift_opt")
+variants=("research_denormalized_opt" "research_intermediate_opt" "research_transitive_opt" "research_uplift_opt")
 
 for variant in "${variants[@]}"; do
   echo "=== Running variant: $variant ==="
   
-  # Run Neo4j
-  echo "--- Running Neo4j for $variant ---"
-  python3 benchmark.py vendor-docker \
-    --vendor-name neo4j-docker \
-    benchmarks "${variant}/*/*/*" \
-    --export-results "results_${variant}_neo4j_large.json" \
-    --no-authorization \
-    --num-workers-for-benchmark 4 \
-    --single-threaded-runtime-sec 60 \
-    --warm-up hot
-  
   # Run Memgraph
   echo "--- Running Memgraph for $variant ---"
-  python3 benchmark.py vendor-docker \
+  py -3.13 benchmark.py vendor-docker \
     --vendor-name memgraph-docker \
     benchmarks "${variant}/*/*/*" \
-    --export-results "results_${variant}_memgraph_large.json" \
+    --export-results "results_${variant}_memgraph_small.json" \
     --no-authorization \
     --num-workers-for-benchmark 4 \
     --single-threaded-runtime-sec 60 \
@@ -29,6 +18,10 @@ for variant in "${variants[@]}"; do
   
   echo "=== Completed variant: $variant ==="
   echo ""
+
+  # Add a 2-minute pause before the next run
+  echo "Sleeping for 2 minutes before next variant..."
+  sleep 120
 done
 
 echo "All variants completed!"

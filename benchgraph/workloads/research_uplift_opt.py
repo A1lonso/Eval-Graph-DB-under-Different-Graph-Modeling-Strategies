@@ -51,7 +51,7 @@ class ResearchUpliftOpt(Workload):
 
     def dataset_generator(self):
         np.random.seed(self.dataset_seed)
-        scale = 10
+        scale = 1
         
         studios = [f"Studio_{i}" for i in range(50)]
         genres = ["Action", "Comedy", "Drama", "Sci-Fi", "Horror", "Romance", "Thriller"]
