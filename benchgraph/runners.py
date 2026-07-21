@@ -78,17 +78,27 @@ def _setup_docker_benchmark_network(network_name):
         command = ["docker", "network", "create", network_name]
         subprocess.run(command, check=True, capture_output=True, text=True)
 
-
-def _get_docker_container_ip(container_name):
-    command = [
-        "docker",
-        "inspect",
-        "--format",
-        "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-        container_name,
-    ]
-    return subprocess.run(command, check=True, capture_output=True, text=True).stdout.strip()
-
+def _get_docker_container_ip(container_name, max_retries=10):
+    """Get container IP with retries for slow container startup."""
+    for attempt in range(max_retries):
+        command = [
+            "docker",
+            "inspect",
+            "--format",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+            container_name,
+        ]
+        try:
+            ip = subprocess.run(command, check=True, capture_output=True, text=True).stdout.strip()
+            if ip:
+                return ip
+        except subprocess.CalledProcessError:
+            pass
+        
+        if attempt < max_retries - 1:
+            time.sleep(0.5)
+    
+    raise Exception(f"Could not get IP for container {container_name} after {max_retries} attempts")
 
 class BaseClient(ABC):
     @abstractmethod
@@ -209,10 +219,37 @@ class BoltClientDocker(BaseClient):
         )
 
     def _remove_container(self):
-        command = ["docker", "rm", "-f", self._container_name]
-        self._run_command(command)
+        try:
+            command = ["docker", "rm", "-f", self._container_name]
+            subprocess.run(command, capture_output=True, text=True, check=False)
+            time.sleep(0.5)
+            command = ["docker", "ps", "-a", "--filter", f"name={self._container_name}", "--format", "{{.Names}}"]
+            result = subprocess.run(command, capture_output=True, text=True, check=True)
+            if self._container_name in result.stdout:
+                log.warning(f"Container {self._container_name} still exists after removal attempt!")
+                command = ["docker", "rm", "-f", self._container_name]
+                subprocess.run(command, capture_output=True, text=True, check=False)
+                time.sleep(0.5)
+        except Exception as e:
+            log.warning(f"Error in remove_container: {e}")
+
+    def _ensure_container_removed(self):
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            self._remove_container()
+            command = ["docker", "ps", "-a", "--filter", f"name={self._container_name}", "--format", "{{.Names}}"]
+            result = subprocess.run(command, capture_output=True, text=True, check=True)
+            if self._container_name not in result.stdout:
+                log.log(f"Container {self._container_name} successfully removed")
+                return True
+            log.warning(f"Container still exists, retry {attempt+1}/{max_attempts}")
+            time.sleep(1)
+        raise Exception(f"Failed to remove container {self._container_name} after {max_attempts} attempts")
 
     def _create_container(self, *args):
+        """Create a new container, ensuring the old one is removed first."""
+        self._ensure_container_removed()
+        
         command = [
             "docker",
             "create",
@@ -224,13 +261,10 @@ class BoltClientDocker(BaseClient):
             *args,
         ]
         self._run_command(command)
+        log.log(f"Created container {self._container_name}")
 
     def _get_logs(self):
-        command = [
-            "docker",
-            "logs",
-            self._container_name,
-        ]
+        command = ["docker", "logs", self._container_name]
         ret = self._run_command(command)
         return ret
 
@@ -249,15 +283,26 @@ class BoltClientDocker(BaseClient):
         if (queries is None and file_path is None) or (queries is not None and file_path is not None):
             raise ValueError("Either queries or input_path must be specified!")
 
-        self._remove_container()
-        ip = _get_docker_container_ip(self._target_db_container)
+        # Get the database IP
+        try:
+            # Wait a moment for the database container to be ready
+            time.sleep(1)
+            ip = _get_docker_container_ip(self._target_db_container)
+            log.log(f"Got container IP: {ip}")
+        except Exception as e:
+            log.error(f"Failed to get container IP: {e}")
+            raise
 
-        # Perform a check to make sure the database is up and running
+        # Ensure any old client container is removed BEFORE we start
+        self._ensure_container_removed()
+
+        # === CHECK PHASE ===
+        # Create check container
         args = self._get_args(
             address=ip,
             input="/bin/check.json",
             num_workers=1,
-            max_retries=max_retries,
+            max_retries=1,
             queries_json=True,
             username=self._username,
             password=self._password,
@@ -265,15 +310,16 @@ class BoltClientDocker(BaseClient):
             validation=False,
             time_dependent_execution=0,
         )
-
         self._create_container(*args)
 
+        # Create check file
         check_file = Path(self._directory.name) / "check.json"
         with open(check_file, "w") as f:
             query = ["RETURN 0;", {}]
             json.dump(query, f)
             f.write("\n")
 
+        # Copy check file to container
         command = [
             "docker",
             "cp",
@@ -282,25 +328,34 @@ class BoltClientDocker(BaseClient):
         ]
         self._run_command(command)
 
-        command = [
-            "docker",
-            "start",
-            "-i",
-            self._container_name,
-        ]
-        while True:
+        # Check if database is ready
+        command = ["docker", "start", "-i", self._container_name]
+        check_success = False
+        for attempt in range(3):
             try:
                 self._run_command(command)
+                check_success = True
+                log.log("Database is ready!")
                 break
             except subprocess.CalledProcessError as e:
-                log.log("Checking if database is up and running failed!")
-                log.warning("Reported errors from client:")
-                log.warning("Error: {}".format(e.stderr))
-                log.warning("Database is not up yet, waiting 3 second")
-                time.sleep(3)
+                log.warning(f"Database check attempt {attempt+1}/3 failed: {e.stderr}")
+                if attempt < 2:
+                    log.warning("Waiting 3 seconds before retry...")
+                    time.sleep(3)
+                    # Refresh IP in case container restarted
+                    try:
+                        ip = _get_docker_container_ip(self._target_db_container)
+                        log.log(f"Refreshed DB IP: {ip}")
+                    except Exception:
+                        pass
 
-        self._remove_container()
+        # Remove check container
+        self._ensure_container_removed()
 
+        if not check_success:
+            raise Exception("Database failed to become ready after multiple attempts")
+
+        # === QUERY EXECUTION PHASE ===
         queries_and_args_json = False
         if queries is not None:
             queries_and_args_json = True
@@ -310,12 +365,12 @@ class BoltClientDocker(BaseClient):
                     json.dump(query, f)
                     f.write("\n")
 
-        self._remove_container()
+        # Get fresh IP for the actual query execution
         ip = _get_docker_container_ip(self._target_db_container)
+        log.log(f"Using IP for query execution: {ip}")
 
-        # Query file JSON or Cypher
+        # Create query container
         file = Path(file_path)
-
         args = self._get_args(
             address=ip,
             input="/bin/" + file.name,
@@ -328,9 +383,9 @@ class BoltClientDocker(BaseClient):
             validation=validation,
             time_dependent_execution=time_dependent_execution,
         )
-
         self._create_container(*args)
 
+        # Copy query file to container
         command = [
             "docker",
             "cp",
@@ -338,33 +393,52 @@ class BoltClientDocker(BaseClient):
             self._container_name + ":/bin/" + file.name,
         ]
         self._run_command(command)
+
+        # Execute queries
         log.log("Starting query execution...")
         try:
-            command = [
-                "docker",
-                "start",
-                "-i",
-                self._container_name,
-            ]
+            command = ["docker", "start", "-i", self._container_name]
             self._run_command(command)
         except subprocess.CalledProcessError as e:
-            log.warning("Reported errors from client:")
-            log.warning("Error: {}".format(e.stderr))
+            log.warning(f"Reported errors from client: {e.stderr}")
 
         ret = self._get_logs()
-        error = ret.stderr.strip().split("\n")
-        if error and error[0] != "":
-            log.warning("There is a possibility that query from: {} is not executed properly".format(file_path))
-            log.warning(*error)
-        data = ret.stdout.strip().split("\n")
-        data = [x for x in data if not x.startswith("[")]
-        return list(map(json.loads, data))
-
+        
+        if ret.stderr:
+            error_lines = ret.stderr.strip().split("\n")
+            error_lines = [line for line in error_lines if line.strip()]
+            if error_lines:
+                log.warning("There is a possibility that query from: {} is not executed properly".format(file_path))
+                for line in error_lines:
+                    log.warning(line)
+        
+        results = []
+        if ret.stdout:
+            for line in ret.stdout.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("["):
+                    continue
+                try:
+                    results.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    log.warning(f"Skipping invalid JSON line: {line[:100]}... Error: {e}")
+                    continue
+        
+        # Clean up
+        self._ensure_container_removed()
+        return results
+    
     def _run_command(self, command):
-        ret = subprocess.run(command, capture_output=True, check=True, text=True)
+        """Run a command with error handling."""
+        ret = subprocess.run(command, capture_output=True, text=True, check=False)
         time.sleep(0.2)
+        if ret.returncode != 0:
+            log.error(f"Command failed: {' '.join(command)}")
+            log.error(f"STDERR: {ret.stderr}")
+            raise subprocess.CalledProcessError(ret.returncode, command, ret.stdout, ret.stderr)
         return ret
-
 
 class BaseRunner(ABC):
     subclasses = {}
@@ -516,7 +590,7 @@ class Memgraph(BaseRunner):
         while not stop_event.is_set():
             if self._proc_mg != None:
                 self._rss.append(_get_current_usage(self._proc_mg.pid))
-            time.sleep(0.05)
+            time.sleep(0.2)
         print("Stopped rss tracking. ")
 
     def dump_rss(self, workload):
@@ -868,8 +942,12 @@ class MemgraphDocker(BaseRunner):
         log.init("Starting database for benchmark...")
         command = ["docker", "start", self._container_name]
         self._run_command(command)
+        
+        time.sleep(1)
         ip_address = _get_docker_container_ip(self._container_name)
-        _wait_for_server_socket(self._bolt_port, delay=0.5)
+        log.log(f"Container started with IP: {ip_address}")
+        
+        _wait_for_server_socket(self._bolt_port, ip=ip_address, delay=0.5)
         log.log("Database started.")
 
     def stop_db(self, message):
