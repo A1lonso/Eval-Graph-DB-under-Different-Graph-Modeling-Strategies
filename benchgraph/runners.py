@@ -29,10 +29,12 @@ DOCKER_NETWORK_NAME = "mgbench_network"
 
 def _wait_for_server_socket(port, ip="127.0.0.1", delay=0.1):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    while s.connect_ex((ip, int(port))) != 0:
-        time.sleep(0.01)
-    time.sleep(delay)
-
+    try:
+        while s.connect_ex((ip, int(port))) != 0:
+            time.sleep(0.01)
+        time.sleep(delay)
+    finally:
+        s.close()
 
 def _convert_args_to_flags(*args, **kwargs):
     flags = list(args)
@@ -941,13 +943,12 @@ class MemgraphDocker(BaseRunner):
     def start_db(self, message):
         log.init("Starting database for benchmark...")
         command = ["docker", "start", self._container_name]
+        print("Starting container with command: {}".format(" ".join(command)))
         self._run_command(command)
         
-        time.sleep(1)
-        ip_address = _get_docker_container_ip(self._container_name)
-        log.log(f"Container started with IP: {ip_address}")
+        time.sleep(3)
         
-        _wait_for_server_socket(self._bolt_port, ip=ip_address, delay=0.5)
+        _wait_for_server_socket(self._bolt_port, delay=0.5)
         log.log("Database started.")
 
     def stop_db(self, message):
