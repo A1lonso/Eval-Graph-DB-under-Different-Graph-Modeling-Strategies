@@ -30,11 +30,39 @@ DOCKER_NETWORK_NAME = "mgbench_network"
 def _wait_for_server_socket(port, ip="127.0.0.1", delay=0.1):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        while s.connect_ex((ip, int(port))) != 0:
-            time.sleep(0.01)
-        time.sleep(delay)
+        # Initial wait for port to be open
+        max_attempts = 50
+        for attempt in range(max_attempts):
+            if s.connect_ex((ip, int(port))) == 0:
+                break
+            time.sleep(0.1)
+        else:
+            raise Exception(f"Port {port} never became available after {max_attempts} attempts")
+        
+        # Use a longer delay for Memgraph as it needs time to initialize
+        if "memgraph" in str(ip).lower() or port == 7687:
+            # Increased from 0.1 to 2.0 seconds
+            time.sleep(2.0)
+        else:
+            time.sleep(delay)
+            
+        # Try to send a small health check
+        try:
+            s.settimeout(2.0)
+            # Send a minimal Bolt handshake
+            # This helps verify the server is actually ready to accept connections
+            s.send(b'\x00\x00\x00\x01')  # Bolt version negotiation
+            response = s.recv(4)
+            if len(response) == 0:
+                log.warning("Server socket responded but closed connection, waiting longer...")
+                time.sleep(1.0)
+        except socket.error:
+            log.warning("Socket error during health check, waiting extra time...")
+            time.sleep(2.0)
+            
     finally:
         s.close()
+        time.sleep(0.5)
 
 def _convert_args_to_flags(*args, **kwargs):
     flags = list(args)
@@ -396,13 +424,52 @@ class BoltClientDocker(BaseClient):
         ]
         self._run_command(command)
 
-        # Execute queries
+        time.sleep(1.0)
+
         log.log("Starting query execution...")
-        try:
-            command = ["docker", "start", "-i", self._container_name]
-            self._run_command(command)
-        except subprocess.CalledProcessError as e:
-            log.warning(f"Reported errors from client: {e.stderr}")
+        max_query_retries = 3
+        retry_delay = 2.0
+        
+        for attempt in range(max_query_retries):
+            try:
+                # Try to start and execute the container
+                command = ["docker", "start", "-i", self._container_name]
+                self._run_command(command)
+                # If we get here, execution succeeded
+                break
+            except subprocess.CalledProcessError as e:
+                log.warning(f"Query execution attempt {attempt+1}/{max_query_retries} failed")
+                log.warning(f"Error: {e.stderr}")
+                
+                if attempt < max_query_retries - 1:
+                    log.info(f"Waiting {retry_delay} seconds before retry...")
+                    time.sleep(retry_delay)
+                    
+                    # Check if database is still alive
+                    try:
+                        ip = _get_docker_container_ip(self._target_db_container)
+                        log.log(f"Database IP still reachable: {ip}")
+                        
+                        # Verify we can connect
+                        check_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        check_socket.settimeout(2.0)
+                        if check_socket.connect_ex((ip, int(self._bolt_port))) == 0:
+                            log.log("Database port is open, retrying...")
+                        else:
+                            log.warning("Database port not responding, waiting longer...")
+                            time.sleep(3.0)
+                        check_socket.close()
+                    except Exception as conn_error:
+                        log.warning(f"Could not verify database connectivity: {conn_error}")
+                        time.sleep(3.0)
+                    
+                    # Restart the container with the same parameters
+                    # The container is already created, just start it again
+                    continue
+                else:
+                    # Last attempt failed
+                    log.error(f"All {max_query_retries} query execution attempts failed")
+                    raise e
 
         ret = self._get_logs()
         
