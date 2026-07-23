@@ -1056,47 +1056,169 @@ class MemgraphDocker(BaseRunner):
             file.close()
 
     def _get_cpu_memory_usage(self):
-        command = [
-            "docker",
-            "exec",
-            "-it",
-            self._container_name,
-            "bash",
-            "-c",
-            "grep ^VmPeak /proc/1/status",
-        ]
         usage = {"cpu": 0, "memory": 0}
-        ret = self._run_command(command)
-        memory = ret.stdout.split()
-        usage["memory"] = int(memory[1]) * 1024
-
-        command = [
-            "docker",
-            "exec",
-            "-it",
-            self._container_name,
-            "bash",
-            "-c",
-            "cat /proc/1/stat",
-        ]
-        stat = self._run_command(command).stdout.strip("\n")
-
-        command = [
-            "docker",
-            "exec",
-            "-it",
-            self._container_name,
-            "bash",
-            "-c",
-            "getconf CLK_TCK",
-        ]
-        CLK_TCK = int(self._run_command(command).stdout.strip("\n"))
-
-        cpu_time = sum(map(int, stat.split(")")[1].split()[11:15])) / CLK_TCK
-        usage["cpu"] = cpu_time
-
+        
+        # First check if container is running
+        check_cmd = ["docker", "inspect", "-f", "{{.State.Running}}", self._container_name]
+        try:
+            ret = subprocess.run(check_cmd, capture_output=True, text=True, check=True)
+            if ret.stdout.strip() != "true":
+                log.warning(f"Container {self._container_name} is not running")
+                return usage
+        except subprocess.CalledProcessError:
+            log.warning(f"Could not inspect container {self._container_name}")
+            return usage
+        
+        # Get memory usage - try multiple methods
+        memory_kb = 0
+        
+        # Method 1: Using docker stats (most reliable)
+        try:
+            stats_cmd = [
+                "docker", "stats", "--no-stream", "--format", 
+                "{{.MemUsage}}", self._container_name
+            ]
+            ret = subprocess.run(stats_cmd, capture_output=True, text=True, check=True)
+            if ret.stdout.strip():
+                # Output format: "1.234GiB / 2GiB" or "256MiB / 512MiB"
+                mem_str = ret.stdout.strip().split()[0]  # Take only the used part
+                memory_kb = self._parse_memory_string(mem_str)
+                log.log(f"Memory usage via docker stats: {memory_kb} KB")
+        except (subprocess.CalledProcessError, ValueError, IndexError) as e:
+            log.warning(f"Failed to get memory via docker stats: {e}")
+        
+        # Method 2: Try to get from /proc/1/status inside container
+        if memory_kb == 0:
+            try:
+                # Check if container is running first
+                ps_cmd = ["docker", "ps", "-q", "-f", f"name={self._container_name}"]
+                ps_ret = subprocess.run(ps_cmd, capture_output=True, text=True, check=True)
+                if not ps_ret.stdout.strip():
+                    log.warning(f"Container {self._container_name} not running")
+                    return usage
+                
+                # Try to get the actual PID of the main process
+                pid_cmd = [
+                    "docker", "exec", self._container_name,
+                    "sh", "-c", "ps aux | grep -v grep | grep memgraph | awk '{print $1}' | head -1"
+                ]
+                pid_ret = subprocess.run(pid_cmd, capture_output=True, text=True, check=False)
+                
+                # If we can't find memgraph process, try PID 1
+                pid = pid_ret.stdout.strip() if pid_ret.stdout.strip() else "1"
+                
+                memory_cmd = [
+                    "docker", "exec", self._container_name,
+                    "sh", "-c", f"grep ^VmRSS /proc/{pid}/status 2>/dev/null || grep ^VmPeak /proc/{pid}/status 2>/dev/null || echo '0'"
+                ]
+                ret = subprocess.run(memory_cmd, capture_output=True, text=True, check=False)
+                
+                if ret.stdout.strip():
+                    parts = ret.stdout.strip().split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        memory_kb = int(parts[1])
+                        log.log(f"Memory usage via /proc: {memory_kb} KB")
+            except Exception as e:
+                log.warning(f"Failed to get memory via /proc: {e}")
+        
+        # If all else fails, try docker inspect
+        if memory_kb == 0:
+            try:
+                inspect_cmd = [
+                    "docker", "inspect", 
+                    "-f", "{{.State.Pid}}", 
+                    self._container_name
+                ]
+                ret = subprocess.run(inspect_cmd, capture_output=True, text=True, check=True)
+                if ret.stdout.strip():
+                    pid = ret.stdout.strip()
+                    # Try to read memory from host's /proc for the container's PID
+                    try:
+                        with open(f"/proc/{pid}/status") as f:
+                            for line in f:
+                                if line.startswith("VmRSS:"):
+                                    parts = line.split()
+                                    if len(parts) >= 2 and parts[1].isdigit():
+                                        memory_kb = int(parts[1])
+                                        log.log(f"Memory usage via host /proc: {memory_kb} KB")
+                                        break
+                    except (FileNotFoundError, PermissionError):
+                        pass
+            except Exception as e:
+                log.warning(f"Failed to get memory via inspect: {e}")
+        
+        usage["memory"] = memory_kb * 1024  # Convert KB to bytes
+        
+        # Get CPU usage
+        cpu_seconds = 0
+        try:
+            # Try docker stats for CPU
+            stats_cmd = [
+                "docker", "stats", "--no-stream", "--format", 
+                "{{.CPUPerc}}", self._container_name
+            ]
+            ret = subprocess.run(stats_cmd, capture_output=True, text=True, check=True)
+            if ret.stdout.strip():
+                # Parse percentage
+                cpu_str = ret.stdout.strip().replace('%', '')
+                cpu_percent = float(cpu_str)
+                # Convert percentage to approximate seconds
+                # This is a rough estimate based on the container's runtime
+                inspect_cmd = [
+                    "docker", "inspect", 
+                    "-f", "{{.State.StartedAt}}", 
+                    self._container_name
+                ]
+                ret = subprocess.run(inspect_cmd, capture_output=True, text=True, check=True)
+                if ret.stdout.strip():
+                    from datetime import datetime
+                    start_time = datetime.fromisoformat(ret.stdout.strip().replace('Z', '+00:00'))
+                    elapsed_seconds = (datetime.now().astimezone() - start_time).total_seconds()
+                    # CPU seconds = CPU percentage * elapsed_seconds / 100
+                    cpu_seconds = (cpu_percent * elapsed_seconds) / 100
+        except (subprocess.CalledProcessError, ValueError, IndexError) as e:
+            log.warning(f"Failed to get CPU via docker stats: {e}")
+        
+        usage["cpu"] = cpu_seconds
         return usage
 
+    def _parse_memory_string(self, mem_str):
+        """Parse memory strings like '1.234GiB' or '256MiB' to KB."""
+        mem_str = mem_str.strip()
+        if not mem_str:
+            return 0
+        
+        # Extract number and unit
+        import re
+        match = re.match(r'([\d.]+)([a-zA-Z]+)', mem_str)
+        if not match:
+            return 0
+        
+        value = float(match.group(1))
+        unit = match.group(2).lower()
+        
+        # Convert to KB
+        if unit == 'b':
+            return int(value / 1024)
+        elif unit == 'kb':
+            return int(value)
+        elif unit == 'mb':
+            return int(value * 1024)
+        elif unit == 'gb':
+            return int(value * 1024 * 1024)
+        elif unit == 'tb':
+            return int(value * 1024 * 1024 * 1024)
+        elif unit == 'kib':
+            return int(value)
+        elif unit == 'mib':
+            return int(value * 1024)
+        elif unit == 'gib':
+            return int(value * 1024 * 1024)
+        elif unit == 'tib':
+            return int(value * 1024 * 1024 * 1024)
+        else:
+            return 0
+        
     def _run_command(self, command):
         ret = subprocess.run(command, check=True, capture_output=True, text=True)
 
