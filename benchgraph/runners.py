@@ -1011,10 +1011,19 @@ class MemgraphDocker(BaseRunner):
         log.init("Starting database for benchmark...")
         command = ["docker", "start", self._container_name]
         print("Starting container with command: {}".format(" ".join(command)))
-        self._run_command(command)
+        
+        try:
+            self._run_command(command, timeout=60, max_retries=3)
+        except Exception as e:
+            log.error(f"Failed to start container: {e}")
+            # Try to recreate if start fails
+            log.info("Attempting to recreate container...")
+            self.clean_db()
+            self.start_db_init(message)
+            # Try starting again
+            self._run_command(command, timeout=60, max_retries=3)
         
         time.sleep(3)
-        
         _wait_for_server_socket(self._bolt_port, delay=0.5)
         log.log("Database started.")
 
@@ -1056,17 +1065,18 @@ class MemgraphDocker(BaseRunner):
             file.close()
 
     def _get_cpu_memory_usage(self):
+        """Get CPU and memory usage from the Docker container with timeouts and retries."""
         usage = {"cpu": 0, "memory": 0}
         
         # First check if container is running
         check_cmd = ["docker", "inspect", "-f", "{{.State.Running}}", self._container_name]
         try:
-            ret = subprocess.run(check_cmd, capture_output=True, text=True, check=True)
+            ret = self._run_command(check_cmd, timeout=5, max_retries=1)
             if ret.stdout.strip() != "true":
                 log.warning(f"Container {self._container_name} is not running")
                 return usage
-        except subprocess.CalledProcessError:
-            log.warning(f"Could not inspect container {self._container_name}")
+        except Exception as e:
+            log.warning(f"Could not inspect container {self._container_name}: {e}")
             return usage
         
         # Get memory usage - try multiple methods
@@ -1078,13 +1088,13 @@ class MemgraphDocker(BaseRunner):
                 "docker", "stats", "--no-stream", "--format", 
                 "{{.MemUsage}}", self._container_name
             ]
-            ret = subprocess.run(stats_cmd, capture_output=True, text=True, check=True)
+            ret = self._run_command(stats_cmd, timeout=5, max_retries=1)
             if ret.stdout.strip():
                 # Output format: "1.234GiB / 2GiB" or "256MiB / 512MiB"
                 mem_str = ret.stdout.strip().split()[0]  # Take only the used part
                 memory_kb = self._parse_memory_string(mem_str)
                 log.log(f"Memory usage via docker stats: {memory_kb} KB")
-        except (subprocess.CalledProcessError, ValueError, IndexError) as e:
+        except Exception as e:
             log.warning(f"Failed to get memory via docker stats: {e}")
         
         # Method 2: Try to get from /proc/1/status inside container
@@ -1092,7 +1102,7 @@ class MemgraphDocker(BaseRunner):
             try:
                 # Check if container is running first
                 ps_cmd = ["docker", "ps", "-q", "-f", f"name={self._container_name}"]
-                ps_ret = subprocess.run(ps_cmd, capture_output=True, text=True, check=True)
+                ps_ret = self._run_command(ps_cmd, timeout=5, max_retries=1)
                 if not ps_ret.stdout.strip():
                     log.warning(f"Container {self._container_name} not running")
                     return usage
@@ -1102,7 +1112,7 @@ class MemgraphDocker(BaseRunner):
                     "docker", "exec", self._container_name,
                     "sh", "-c", "ps aux | grep -v grep | grep memgraph | awk '{print $1}' | head -1"
                 ]
-                pid_ret = subprocess.run(pid_cmd, capture_output=True, text=True, check=False)
+                pid_ret = self._run_command(pid_cmd, timeout=5, max_retries=1, check=False)
                 
                 # If we can't find memgraph process, try PID 1
                 pid = pid_ret.stdout.strip() if pid_ret.stdout.strip() else "1"
@@ -1111,7 +1121,7 @@ class MemgraphDocker(BaseRunner):
                     "docker", "exec", self._container_name,
                     "sh", "-c", f"grep ^VmRSS /proc/{pid}/status 2>/dev/null || grep ^VmPeak /proc/{pid}/status 2>/dev/null || echo '0'"
                 ]
-                ret = subprocess.run(memory_cmd, capture_output=True, text=True, check=False)
+                ret = self._run_command(memory_cmd, timeout=5, max_retries=1, check=False)
                 
                 if ret.stdout.strip():
                     parts = ret.stdout.strip().split()
@@ -1121,7 +1131,7 @@ class MemgraphDocker(BaseRunner):
             except Exception as e:
                 log.warning(f"Failed to get memory via /proc: {e}")
         
-        # If all else fails, try docker inspect
+        # Method 3: Try docker inspect to get PID and read from host /proc
         if memory_kb == 0:
             try:
                 inspect_cmd = [
@@ -1129,7 +1139,7 @@ class MemgraphDocker(BaseRunner):
                     "-f", "{{.State.Pid}}", 
                     self._container_name
                 ]
-                ret = subprocess.run(inspect_cmd, capture_output=True, text=True, check=True)
+                ret = self._run_command(inspect_cmd, timeout=5, max_retries=1)
                 if ret.stdout.strip():
                     pid = ret.stdout.strip()
                     # Try to read memory from host's /proc for the container's PID
@@ -1142,42 +1152,110 @@ class MemgraphDocker(BaseRunner):
                                         memory_kb = int(parts[1])
                                         log.log(f"Memory usage via host /proc: {memory_kb} KB")
                                         break
-                    except (FileNotFoundError, PermissionError):
-                        pass
+                    except (FileNotFoundError, PermissionError) as e:
+                        log.warning(f"Could not read /proc/{pid}/status: {e}")
             except Exception as e:
                 log.warning(f"Failed to get memory via inspect: {e}")
+        
+        # Method 4: Try docker top to get memory
+        if memory_kb == 0:
+            try:
+                top_cmd = ["docker", "top", self._container_name, "-o", "rss"]
+                ret = self._run_command(top_cmd, timeout=5, max_retries=1)
+                if ret.stdout.strip():
+                    lines = ret.stdout.strip().split('\n')
+                    if len(lines) > 1:
+                        # Sum RSS from all processes
+                        total_rss_kb = 0
+                        for line in lines[1:]:  # Skip header
+                            parts = line.strip().split()
+                            if len(parts) > 0 and parts[0].isdigit():
+                                total_rss_kb += int(parts[0])
+                        if total_rss_kb > 0:
+                            memory_kb = total_rss_kb
+                            log.log(f"Memory usage via docker top: {memory_kb} KB")
+            except Exception as e:
+                log.warning(f"Failed to get memory via docker top: {e}")
+        
+        # Method 5: Try docker system df for container size (last resort)
+        if memory_kb == 0:
+            try:
+                # Get container size
+                size_cmd = ["docker", "inspect", "-f", "{{.SizeRw}}", self._container_name]
+                ret = self._run_command(size_cmd, timeout=5, max_retries=1)
+                if ret.stdout.strip() and ret.stdout.strip().isdigit():
+                    memory_kb = int(ret.stdout.strip()) / 1024  # Convert bytes to KB
+                    log.log(f"Memory usage via container size: {memory_kb} KB")
+            except Exception as e:
+                log.warning(f"Failed to get memory via container size: {e}")
         
         usage["memory"] = memory_kb * 1024  # Convert KB to bytes
         
         # Get CPU usage
         cpu_seconds = 0
         try:
-            # Try docker stats for CPU
+            # Method 1: Try docker stats for CPU
             stats_cmd = [
                 "docker", "stats", "--no-stream", "--format", 
                 "{{.CPUPerc}}", self._container_name
             ]
-            ret = subprocess.run(stats_cmd, capture_output=True, text=True, check=True)
+            ret = self._run_command(stats_cmd, timeout=5, max_retries=1)
             if ret.stdout.strip():
                 # Parse percentage
                 cpu_str = ret.stdout.strip().replace('%', '')
                 cpu_percent = float(cpu_str)
+                
                 # Convert percentage to approximate seconds
-                # This is a rough estimate based on the container's runtime
                 inspect_cmd = [
                     "docker", "inspect", 
                     "-f", "{{.State.StartedAt}}", 
                     self._container_name
                 ]
-                ret = subprocess.run(inspect_cmd, capture_output=True, text=True, check=True)
+                ret = self._run_command(inspect_cmd, timeout=5, max_retries=1)
                 if ret.stdout.strip():
                     from datetime import datetime
                     start_time = datetime.fromisoformat(ret.stdout.strip().replace('Z', '+00:00'))
                     elapsed_seconds = (datetime.now().astimezone() - start_time).total_seconds()
                     # CPU seconds = CPU percentage * elapsed_seconds / 100
                     cpu_seconds = (cpu_percent * elapsed_seconds) / 100
-        except (subprocess.CalledProcessError, ValueError, IndexError) as e:
+                    log.log(f"CPU usage: {cpu_percent}% over {elapsed_seconds:.1f}s = {cpu_seconds:.2f}s")
+        except Exception as e:
             log.warning(f"Failed to get CPU via docker stats: {e}")
+        
+        # Method 2: Try docker top for CPU (alternative)
+        if cpu_seconds == 0:
+            try:
+                top_cmd = ["docker", "top", self._container_name, "-o", "pcpu"]
+                ret = self._run_command(top_cmd, timeout=5, max_retries=1)
+                if ret.stdout.strip():
+                    lines = ret.stdout.strip().split('\n')
+                    if len(lines) > 1:
+                        # Sum CPU percentages from all processes
+                        total_cpu_percent = 0.0
+                        for line in lines[1:]:  # Skip header
+                            parts = line.strip().split()
+                            if len(parts) > 0:
+                                try:
+                                    total_cpu_percent += float(parts[0])
+                                except ValueError:
+                                    pass
+                        
+                        if total_cpu_percent > 0:
+                            # Convert to seconds (rough estimate)
+                            inspect_cmd = [
+                                "docker", "inspect", 
+                                "-f", "{{.State.StartedAt}}", 
+                                self._container_name
+                            ]
+                            ret = self._run_command(inspect_cmd, timeout=5, max_retries=1)
+                            if ret.stdout.strip():
+                                from datetime import datetime
+                                start_time = datetime.fromisoformat(ret.stdout.strip().replace('Z', '+00:00'))
+                                elapsed_seconds = (datetime.now().astimezone() - start_time).total_seconds()
+                                cpu_seconds = (total_cpu_percent * elapsed_seconds) / 100
+                                log.log(f"CPU usage via docker top: {cpu_seconds:.2f}s")
+            except Exception as e:
+                log.warning(f"Failed to get CPU via docker top: {e}")
         
         usage["cpu"] = cpu_seconds
         return usage
@@ -1218,13 +1296,111 @@ class MemgraphDocker(BaseRunner):
             return int(value * 1024 * 1024 * 1024)
         else:
             return 0
+            
+    def _run_command(self, command, timeout=30, max_retries=3, retry_delay=2.0):
+        """Run a command with retry logic and timeout."""
+        last_exception = None
         
-    def _run_command(self, command):
-        ret = subprocess.run(command, check=True, capture_output=True, text=True)
-
-        time.sleep(0.2)
-        return ret
-
+        for attempt in range(max_retries):
+            try:
+                cmd_str = ' '.join(str(c) for c in command[:3]) + '...'
+                log.log(f"Running command (attempt {attempt+1}/{max_retries}): {cmd_str}")
+                
+                str_command = [str(c) for c in command]
+                
+                # Run with timeout
+                ret = subprocess.run(
+                    str_command,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False
+                )
+                
+                # Small yield to kernel after each command
+                time.sleep(0.05)
+                
+                if ret.returncode == 0:
+                    return ret
+                else:
+                    error_msg = ret.stderr.strip() if ret.stderr else f"Return code: {ret.returncode}"
+                    log.warning(f"Command failed with return code {ret.returncode}: {error_msg}")
+                    
+                    # Check if this is a recoverable error
+                    recoverable = [
+                        "connection refused",
+                        "cannot connect", 
+                        "timeout",
+                        "broken pipe",
+                        "resource temporarily unavailable",
+                        "no such container",
+                        "container not running"
+                    ]
+                    
+                    is_recoverable = any(err in error_msg.lower() for err in recoverable)
+                    
+                    if is_recoverable:
+                        last_exception = subprocess.CalledProcessError(ret.returncode, command, ret.stdout, ret.stderr)
+                        
+                        if attempt < max_retries - 1:
+                            wait_time = retry_delay * (attempt + 1)
+                            log.info(f"Retrying in {wait_time} seconds...")
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            raise last_exception
+                    else:
+                        raise subprocess.CalledProcessError(ret.returncode, command, ret.stdout, ret.stderr)
+                        
+            except subprocess.TimeoutExpired as e:
+                log.warning(f"Command timed out after {timeout} seconds (attempt {attempt+1}/{max_retries})")
+                last_exception = e
+                
+                if attempt < max_retries - 1:
+                    # Try to clean up hanging docker processes
+                    try:
+                        str_command = [str(c) for c in command]
+                        if len(str_command) > 0 and "docker" in str_command[0] and "start" in str_command:
+                            container_name = str_command[-1] if str_command[-1] != "-i" else str_command[-2]
+                            kill_cmd = ["docker", "kill", container_name]
+                            subprocess.run(kill_cmd, capture_output=True, timeout=2, check=False)
+                    except:
+                        pass
+                    
+                    wait_time = retry_delay * (attempt + 1)
+                    log.info(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    cmd_str = ' '.join(str(c) for c in command)
+                    raise TimeoutError(f"Command timed out after {max_retries} attempts: {cmd_str}")
+                    
+            except subprocess.CalledProcessError as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    error_msg = str(e.stderr) if e.stderr else str(e)
+                    recoverable = ["connection refused", "cannot connect", "timeout"]
+                    if any(err in error_msg.lower() for err in recoverable):
+                        wait_time = retry_delay * (attempt + 1)
+                        log.info(f"Recoverable error, retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+                        continue
+                log.error(f"Command failed after {attempt+1} attempts: {e}")
+                raise
+            
+            except Exception as e:
+                log.error(f"Unexpected error in _run_command: {e}")
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (attempt + 1)
+                    time.sleep(wait_time)
+                    continue
+                raise
+        
+        if last_exception:
+            raise last_exception
+        else:
+            cmd_str = ' '.join(str(c) for c in command)
+            raise Exception(f"Command failed for unknown reason: {cmd_str}")
 
 class Neo4jDocker(BaseRunner):
     def __init__(self, benchmark_context: BenchmarkContext):
