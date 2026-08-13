@@ -116,8 +116,8 @@ def parse_args():
         Realistic workload can be run as a single configuration for all groups of queries,
         Pass the positional arguments as values of what percentage of
         write/read/update/analytical queries you want to have in your workload.
-        Example:  --workload-realistic 1000 20 70 10 0 will execute 1000 queries, 20% write,
-        70% read, 10% update and 0% analytical.""",
+        Example:  --workload-realistic 1000 20 70 10 0 will execute 1000 queries, 20%% write,
+        70%% read, 10%% update and 0%% analytical.""",
     )
 
     benchmark_parser.add_argument(
@@ -129,8 +129,8 @@ def parse_args():
         By passing one more positional argument, you are defining what percentage of that query
         will be in mixed workload, and this is executed for each query. The rest of the queries will be
         selected from the appropriate groups
-        Running --mixed-workload 1000 30 0 0 0 70, will execute each query 700 times or 70%,
-        with the presence of 300 write queries from write type or 30%""",
+        Running --mixed-workload 1000 30 0 0 0 70, will execute each query 700 times or 70%%,
+        with the presence of 300 write queries from write type or 30%%""",
     )
 
     benchmark_parser.add_argument(

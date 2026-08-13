@@ -1,13 +1,13 @@
 #!/bin/bash
 
-variants=("research_denormalized_opt" "research_intermediate_opt" "research_transitive_opt" "research_uplift_opt")
+variants=("research_base_opt" "research_denormalized_opt" "research_intermediate_opt" "research_transitive_opt" "research_uplift_opt")
 
 for variant in "${variants[@]}"; do
   echo "=== Running variant: $variant ==="
   
   # Run Memgraph
   echo "--- Running Memgraph for $variant ---"
-  py -3.13 benchmark.py vendor-docker \
+  python3 benchmark.py vendor-docker \
     --vendor-name memgraph-docker \
     benchmarks "${variant}/*/*/*" \
     --export-results "results_${variant}_memgraph_small.json" \
