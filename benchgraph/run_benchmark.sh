@@ -5,12 +5,12 @@ variants=("research_base_opt" "research_denormalized_opt" "research_intermediate
 for variant in "${variants[@]}"; do
   echo "=== Running variant: $variant ==="
   
-  # Run Memgraph
-  echo "--- Running Memgraph for $variant ---"
+  # Run Neo4j
+  echo "--- Running Neo4j for $variant ---"
   python3 benchmark.py vendor-docker \
-    --vendor-name memgraph-docker \
+    --vendor-name neo4j-docker \
     benchmarks "${variant}/*/*/*" \
-    --export-results "results_${variant}_memgraph_small.json" \
+    --export-results "results_${variant}_neo4j_small.json" \
     --no-authorization \
     --num-workers-for-benchmark 4 \
     --single-threaded-runtime-sec 60 \
