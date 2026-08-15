@@ -10,7 +10,7 @@ for variant in "${variants[@]}"; do
   python3 benchmark.py vendor-docker \
     --vendor-name neo4j-docker \
     benchmarks "${variant}/*/*/*" \
-    --export-results "results_${variant}_neo4j_small.json" \
+    --export-results "results_${variant}_neo4j_large.json" \
     --no-authorization \
     --num-workers-for-benchmark 4 \
     --single-threaded-runtime-sec 60 \
