@@ -950,21 +950,22 @@ class MemgraphDocker(BaseRunner):
         log.init("Starting database for import...")
         try:
             command = [
-                "docker",
-                "run",
+                "docker", "run",
                 "--detach",
-                "--network",
-                DOCKER_NETWORK_NAME,
-                "--name",
-                self._container_name,
+                "--network", DOCKER_NETWORK_NAME,
+                "--name", self._container_name,
                 "-it",
-                "-p",
-                self._bolt_port + ":" + self._bolt_port,
+                "-p", self._bolt_port + ":" + self._bolt_port,
+                "--memory=20g",          # 20GB RAM
+                "--memory-swap=25g",     # 5GB swap allowed (total 25GB)
+                "--shm-size=2g",         # Shared memory
                 "memgraph/memgraph:3.12.0",
                 "--storage-wal-enabled=false",
                 "--data-recovery-on-startup=true",
                 "--storage-snapshot-interval-sec=0",
-                "--storage-snapshot-on-exit=true"
+                "--storage-snapshot-on-exit=true",
+                "--storage-properties-on-edges=true",
+                "--memory-limit=20480",  # 20GB in MB
             ]
             command.extend(self._set_args(**self._vendor_args))
             ret = self._run_command(command)
