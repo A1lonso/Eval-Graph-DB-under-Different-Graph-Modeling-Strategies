@@ -38,14 +38,7 @@ def detect_top_level_key(data):
 
 def extract_query_metrics(file_path):
     """
-    Extract both duration and throughput for each query from the JSON file.
-    Automatically detects the correct top-level key.
-    
-    Args:
-        file_path: Path to the JSON file
-        
-    Returns:
-        tuple: (durations dict, throughputs dict)
+    Extract duration, throughput, CPU, and memory for each query.
     """
     with open(file_path, 'r') as f:
         data = json.load(f)
@@ -73,6 +66,8 @@ def extract_query_metrics(file_path):
     
     durations = {}
     throughputs = {}
+    cpu_usage = {}
+    memory_usage = {}
     
     # Get the test data (could be under 'default' or directly under top_key)
     test_data = None
@@ -94,6 +89,9 @@ def extract_query_metrics(file_path):
                         query_data = test_data[alt_name]['without_fine_grained_authorization']
                         durations[q_key] = query_data['duration']
                         throughputs[q_key] = query_data['throughput']
+                        database = query_data.get('database', {})
+                        cpu_usage[q_key] = database.get('cpu', 0)
+                        memory_usage[q_key] = database.get('memory', 0)
                         found = True
                         break
                     except KeyError:
@@ -104,12 +102,17 @@ def extract_query_metrics(file_path):
                 query_data = test_data[query_name]['without_fine_grained_authorization']
                 durations[q_key] = query_data['duration']
                 throughputs[q_key] = query_data['throughput']
+                database = query_data.get('database', {})
+                cpu_usage[q_key] = database.get('cpu', 0)
+                memory_usage[q_key] = database.get('memory', 0)
         except KeyError as e:
             print(f"Warning: Could not find metrics for {q_key} ({query_name}) in {file_path}")
             durations[q_key] = None
             throughputs[q_key] = None
+            cpu_usage[q_key] = None
+            memory_usage[q_key] = None
     
-    return durations, throughputs
+    return durations, throughputs, cpu_usage, memory_usage
 
 def create_comparison_charts(baseline_small_file, baseline_large_file, 
                            variant_small_file=None, variant_large_file=None,
@@ -117,7 +120,7 @@ def create_comparison_charts(baseline_small_file, baseline_large_file,
                            output_dir="charts"):
     """
     Create grouped bar charts comparing query metrics across configurations.
-    Generates both Duration and Throughput charts.
+    Generates Duration and Throughput charts.
     
     Args:
         baseline_small_file: Path to Baseline Small JSON file
@@ -133,25 +136,23 @@ def create_comparison_charts(baseline_small_file, baseline_large_file,
     
     # Extract metrics from all files
     print(f"Reading Baseline Small: {baseline_small_file}")
-    baseline_small_dur, baseline_small_tput = extract_query_metrics(baseline_small_file)
+    baseline_small_dur, baseline_small_tput, _, _ = extract_query_metrics(baseline_small_file)
     
     print(f"Reading Baseline Large: {baseline_large_file}")
-    baseline_large_dur, baseline_large_tput = extract_query_metrics(baseline_large_file)
+    baseline_large_dur, baseline_large_tput, _, _ = extract_query_metrics(baseline_large_file)
     
-    variant_small_dur = None
-    variant_small_tput = None
-    variant_large_dur = None
-    variant_large_tput = None
+    variant_small_dur = variant_small_tput = None
+    variant_large_dur = variant_large_tput = None
     
     if variant_small_file and os.path.exists(variant_small_file):
         print(f"Reading Variant Small: {variant_small_file}")
-        variant_small_dur, variant_small_tput = extract_query_metrics(variant_small_file)
+        variant_small_dur, variant_small_tput, _, _ = extract_query_metrics(variant_small_file)
     else:
         print(f"Warning: Variant Small file not found: {variant_small_file}")
     
     if variant_large_file and os.path.exists(variant_large_file):
         print(f"Reading Variant Large: {variant_large_file}")
-        variant_large_dur, variant_large_tput = extract_query_metrics(variant_large_file)
+        variant_large_dur, variant_large_tput, _, _ = extract_query_metrics(variant_large_file)
     else:
         print(f"Warning: Variant Large file not found: {variant_large_file}")
     
@@ -259,7 +260,7 @@ def create_comparison_charts(baseline_small_file, baseline_large_file,
     plt.savefig(throughput_output, dpi=300, bbox_inches='tight')
     print(f"Throughput chart saved as: {throughput_output}")
     plt.close(fig2)
-    
+
     # ==================== PRINT SUMMARY ====================
     print("\n" + "="*90)
     print(f"SUMMARY - {variant_name} vs Baseline Comparison")
@@ -299,7 +300,7 @@ def create_comparison_charts(baseline_small_file, baseline_large_file,
             large_improvement = 0
             
         print(f"{q:<8} {small_improvement:<20.1f}% {large_improvement:<20.1f}%")
-    
+
     return {
         'queries': queries,
         'duration': {
@@ -315,6 +316,69 @@ def create_comparison_charts(baseline_small_file, baseline_large_file,
             'variant_large': variant_large_tput_vals
         }
     }
+
+def create_large_resource_charts(baseline_large_file, configs, output_dir="charts"):
+    """Create one CPU chart and one memory chart for all large configurations."""
+    os.makedirs(output_dir, exist_ok=True)
+    configurations = [('Baseline', baseline_large_file)]
+    configurations.extend((config['variant_name'], config['variant_large_file']) for config in configs)
+
+    queries = ['Q1', 'Q2', 'Q3', 'Q4', 'Q5', 'Q6', 'Q7']
+    resource_data = []
+    for name, file_path in configurations:
+        if not os.path.exists(file_path):
+            print(f"Warning: Skipping {name}; large file not found: {file_path}")
+            continue
+        print(f"Reading {name} Large: {file_path}")
+        _, _, cpu_usage, memory_usage = extract_query_metrics(file_path)
+        resource_data.append({
+            'name': name,
+            'cpu': [cpu_usage.get(query, 0) or 0 for query in queries],
+            'memory': [memory_usage.get(query, 0) / 1024**2 for query in queries]
+        })
+
+    if not resource_data:
+        raise ValueError('No large configuration files found for resource charts')
+
+    x = np.arange(len(queries))
+    width = 0.8 / len(resource_data)
+    colors = ['#2E86C1', '#E74C3C', '#27AE60', '#F39C12', '#8E44AD', '#16A085']
+
+    def create_resource_chart(metric, ylabel, title, filename, formatter):
+        fig, ax = plt.subplots(figsize=(14, 8))
+        for index, configuration in enumerate(resource_data):
+            bars = ax.bar(x - 0.4 + (index + 0.5) * width, configuration[metric], width,
+                          label=configuration['name'], color=colors[index % len(colors)],
+                          edgecolor='black', linewidth=0.5)
+            for bar in bars:
+                height = bar.get_height()
+                if height > 0:
+                    ax.text(bar.get_x() + bar.get_width() / 2, height, formatter(height),
+                            ha='center', va='bottom', fontsize=7, rotation=90)
+        ax.set_xlabel('Query', fontsize=12, fontweight='bold')
+        ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(queries)
+        ax.legend(loc='upper left', bbox_to_anchor=(1, 1), fontsize=10)
+        ax.set_yscale('log')
+        ax.grid(True, axis='y', linestyle='--', alpha=0.3)
+        plt.tight_layout()
+        output_path = os.path.join(output_dir, filename)
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Resource chart saved as: {output_path}")
+        plt.close(fig)
+
+    create_resource_chart(
+        'cpu', 'CPU Usage (%) - Logarithmic Scale',
+        'CPU Usage Comparison - All Large Configurations',
+        'cpu_usage_comparison_all_large.png', lambda value: f'{value:.1f}%')
+    create_resource_chart(
+        'memory', 'Memory Usage (MiB) - Logarithmic Scale',
+        'Memory Usage Comparison - All Large Configurations',
+        'memory_usage_comparison_all_large.png',
+        lambda value: f'{value / 1024:.1f}GiB' if value >= 1024 else f'{value:.0f}MiB')
+
 
 def generate_all_comparisons(configs, output_dir="charts"):
     """
@@ -343,6 +407,8 @@ def generate_all_comparisons(configs, output_dir="charts"):
             variant_name=config['variant_name'],
             output_dir=output_dir
         )
+
+    create_large_resource_charts(baseline_large_file, configs, output_dir)
 
 if __name__ == "__main__":
     # Check if baseline files exist
