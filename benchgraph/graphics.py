@@ -87,7 +87,7 @@ def extract_query_metrics(file_path):
                 for alt_name in query_mapping_alt[q_key]:
                     try:
                         query_data = test_data[alt_name]['without_fine_grained_authorization']
-                        durations[q_key] = query_data['duration']
+                        durations[q_key] = query_data['latency_stats']['mean']
                         throughputs[q_key] = query_data['throughput']
                         database = query_data.get('database', {})
                         cpu_usage[q_key] = database.get('cpu', 0)
@@ -100,7 +100,7 @@ def extract_query_metrics(file_path):
                     raise KeyError(f"Could not find {q_key} in {file_path}")
             else:
                 query_data = test_data[query_name]['without_fine_grained_authorization']
-                durations[q_key] = query_data['duration']
+                durations[q_key] = query_data['latency_stats']['mean']
                 throughputs[q_key] = query_data['throughput']
                 database = query_data.get('database', {})
                 cpu_usage[q_key] = database.get('cpu', 0)
@@ -379,6 +379,140 @@ def create_large_resource_charts(baseline_large_file, configs, output_dir="chart
         'memory_usage_comparison_all_large.png',
         lambda value: f'{value / 1024:.1f}GiB' if value >= 1024 else f'{value:.0f}MiB')
 
+def create_dataset_charts(configurations, output_dir, filename_prefix, display_name, include_resources=False):
+    """Create duration and throughput charts, plus Large-only resource charts."""
+    os.makedirs(output_dir, exist_ok=True)
+    queries = ['Q1', 'Q2', 'Q3', 'Q4', 'Q5', 'Q6', 'Q7']
+    loaded = []
+
+    for name, file_path in configurations:
+        if not file_path or not os.path.exists(file_path):
+            print(f"Warning: Skipping {name}; file not found: {file_path}")
+            continue
+        print(f"Reading {name}: {file_path}")
+        duration, throughput, cpu, memory = extract_query_metrics(file_path)
+        loaded.append({
+            'name': name,
+            'duration': [duration.get(query) or 0 for query in queries],
+            'throughput': [throughput.get(query) or 0 for query in queries],
+            'cpu': [cpu.get(query) or 0 for query in queries],
+            'memory': [(memory.get(query) or 0) / 1024**2 for query in queries]
+        })
+
+    if not loaded:
+        raise ValueError(f'No result files found for {filename_prefix}')
+
+    x = np.arange(len(queries))
+    def series_color(name):
+        if name.startswith('Baseline'):
+            return {'Small': '#87CEEB', 'Large': '#2E86C1', 'Extra': '#0B3D91'}.get(
+                next((size for size in ('Small', 'Large', 'Extra') if size in name), 'Large'))
+        return {'Small': '#F5A29A', 'Large': '#E74C3C', 'Extra': '#A61B1B'}.get(
+            next((size for size in ('Small', 'Large', 'Extra') if size in name), 'Large'))
+
+    def create_chart(metric, ylabel, title, suffix, formatter, chart_data, logarithmic=True):
+        fig, ax = plt.subplots(figsize=(16, 9))
+        width = min(0.8 / len(chart_data), 0.2)
+        for index, configuration in enumerate(chart_data):
+            group_width = 0.8 / len(chart_data)
+            offset = -0.4 + (index + 0.5) * group_width
+            bars = ax.bar(x + offset, configuration[metric], width,
+                          label=configuration['name'], color=series_color(configuration['name']),
+                          edgecolor='black', linewidth=0.5)
+        ax.set_xlabel('Query', fontsize=14, fontweight='bold')
+        ax.set_ylabel(ylabel, fontsize=14, fontweight='bold')
+        ax.set_title(title, fontsize=18, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(queries)
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.12),
+              ncol=min(len(chart_data), 5), fontsize=11, title='Variant Type',
+              title_fontsize=12)
+        if logarithmic:
+            ax.set_yscale('log')
+        ax.grid(True, axis='y', linestyle='--', alpha=0.3)
+        plt.tight_layout(rect=(0, 0.08, 1, 1))
+        output_path = os.path.join(output_dir, f'{filename_prefix}_{suffix}.png')
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Chart saved as: {output_path}")
+        plt.close(fig)
+
+    create_chart('duration', 'Execution Time (seconds) - Log scale',
+                 display_name, 'duration', lambda value: f'{value:.2f}s', loaded)
+    create_chart('throughput', 'Queries per second (log scale)',
+                 display_name, 'throughput',
+                 lambda value: f'{value / 1000:.1f}K' if value >= 1000 else f'{value:.0f}', loaded)
+    if include_resources:
+        large_loaded = [configuration for configuration in loaded if '(Large)' in configuration['name']]
+        if not large_loaded:
+            raise ValueError(f'No Large result files found for {filename_prefix}')
+        create_chart('cpu', 'CPU Usage (%) - Logarithmic Scale',
+                     display_name, 'cpu_usage',
+                     lambda value: f'{value:.1f}%', large_loaded)
+        create_chart('memory', 'Memory Usage (MiB) - Logarithmic Scale',
+                     display_name, 'memory_usage',
+                     lambda value: f'{value / 1024:.1f}GiB' if value >= 1024 else f'{value:.0f}MiB',
+                     large_loaded, logarithmic=False)
+
+
+def create_all_large_resource_charts(configurations, output_dir, filename_prefix):
+    """Create CPU and memory charts comparing every available Large configuration."""
+    os.makedirs(output_dir, exist_ok=True)
+    queries = ['Q1', 'Q2', 'Q3', 'Q4', 'Q5', 'Q6', 'Q7']
+    resource_data = []
+
+    for name, file_path in configurations:
+        if not file_path or not os.path.exists(file_path):
+            print(f"Warning: Skipping {name}; file not found: {file_path}")
+            continue
+        print(f"Reading {name}: {file_path}")
+        _, _, cpu, memory = extract_query_metrics(file_path)
+        resource_data.append({
+            'name': name,
+            'cpu': [cpu.get(query) or 0 for query in queries],
+            'memory': [(memory.get(query) or 0) / 1024**2 for query in queries]
+        })
+
+    if not resource_data:
+        raise ValueError(f'No Large result files found for {filename_prefix}')
+
+    x = np.arange(len(queries))
+    group_width = 0.8 / len(resource_data)
+    width = min(group_width, 0.2)
+    resource_colors = ['#2E86C1', '#E74C3C', '#27AE60', '#F39C12', '#8E44AD', '#16A085']
+    readable_name = filename_prefix.replace('_', ' ').title()
+
+    def create_resource_chart(metric, ylabel, title, suffix, formatter, logarithmic=True):
+        fig, ax = plt.subplots(figsize=(16, 9))
+        for index, configuration in enumerate(resource_data):
+            offset = -0.4 + (index + 0.5) * group_width
+            bars = ax.bar(x + offset, configuration[metric], width,
+                          label=configuration['name'], color=resource_colors[index % len(resource_colors)],
+                          edgecolor='black', linewidth=0.5)
+        ax.set_xlabel('Query', fontsize=14, fontweight='bold')
+        ax.set_ylabel(ylabel, fontsize=14, fontweight='bold')
+        ax.set_title(title, fontsize=18, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(queries)
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.12),
+              ncol=min(len(resource_data), 5), fontsize=11, title='Variant Type',
+              title_fontsize=12)
+        if logarithmic:
+            ax.set_yscale('log')
+        ax.grid(True, axis='y', linestyle='--', alpha=0.3)
+        plt.tight_layout(rect=(0, 0.08, 1, 1))
+        output_path = os.path.join(output_dir, f'{filename_prefix}_{suffix}.png')
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Chart saved as: {output_path}")
+        plt.close(fig)
+
+    create_resource_chart('cpu', 'CPU Usage',
+                          'CPU Usage Comparison', 'cpu_usage',
+                          lambda value: f'{value:.1f}%')
+    create_resource_chart('memory', 'Memory Usage (MiB)',
+                          'Memory Usage Comparison', 'memory_usage',
+                          lambda value: f'{value / 1024:.1f}GiB' if value >= 1024 else f'{value:.0f}MiB',
+                          logarithmic=False)
+
 
 def generate_all_comparisons(configs, output_dir="charts"):
     """
@@ -390,25 +524,53 @@ def generate_all_comparisons(configs, output_dir="charts"):
             - variant_large_file: Path to variant large JSON
             - variant_name: Name of the variant
     """
-    # Fixed baseline files
-    baseline_small_file = "results_research_base_opt_neo4j_small.json"
-    baseline_large_file = "results_research_base_opt_neo4j_large.json"
-    
+    baseline = 'results_research_base_opt'
+    variant_display_names = {
+        'Denormalized': 'Aggregation-Materialization',
+        'Transitive': 'Path-to-Edge',
+        'Intermediate': 'Edge-To-Node',
+        'Uplift': 'Property-To-Node'
+    }
+    neo4j_large_configurations = [('Baseline (Large)', f'{baseline}_neo4j_large.json')]
+    memgraph_large_configurations = [('Baseline (Large)', f'{baseline}_memgraph_large.json')]
     for config in configs:
-        print(f"\n{'='*60}")
-        print(f"Processing {config['variant_name']}...")
-        print(f"{'='*60}")
-        
-        create_comparison_charts(
-            baseline_small_file=baseline_small_file,
-            baseline_large_file=baseline_large_file,
-            variant_small_file=config['variant_small_file'],
-            variant_large_file=config['variant_large_file'],
-            variant_name=config['variant_name'],
-            output_dir=output_dir
-        )
+        variant_slug = config['variant_name'].lower()
+        neo4j_configurations = [
+            ('Baseline (Small)', f'{baseline}_neo4j_small.json'),
+            (f"{config['variant_name']} (Small)", config['variant_small_file_neo4j']),
+            ('Baseline (Large)', f'{baseline}_neo4j_large.json'),
+            (f"{config['variant_name']} (Large)", config['variant_large_file_neo4j']),
+            ('Baseline (Extra)', f'{baseline}_neo4j_extra.json'),
+            (f"{config['variant_name']} (Extra)", config.get('variant_extra_file'))
+        ]
+        display_name = variant_display_names[config['variant_name']]
+        neo4j_configurations[1] = (f'{display_name} (Small)', neo4j_configurations[1][1])
+        neo4j_configurations[3] = (f'{display_name} (Large)', neo4j_configurations[3][1])
+        neo4j_configurations[5] = (f'{display_name} (Extra)', neo4j_configurations[5][1])
+        create_dataset_charts(neo4j_configurations,
+                              os.path.join(output_dir, 'neo4j', variant_slug), variant_slug,
+                              display_name)
+        neo4j_large_configurations.append(
+            (display_name, config['variant_large_file_neo4j']))
 
-    create_large_resource_charts(baseline_large_file, configs, output_dir)
+        memgraph_configurations = [
+            ('Baseline (Small)', f'{baseline}_memgraph_small.json'),
+            (f"{config['variant_name']} (Small)", config['variant_small_file_memgraph']),
+            ('Baseline (Large)', f'{baseline}_memgraph_large.json'),
+            (f"{config['variant_name']} (Large)", config['variant_large_file_memgraph'])
+        ]
+        memgraph_configurations[1] = (f'{display_name} (Small)', memgraph_configurations[1][1])
+        memgraph_configurations[3] = (f'{display_name} (Large)', memgraph_configurations[3][1])
+        create_dataset_charts(memgraph_configurations,
+                              os.path.join(output_dir, 'memgraph', variant_slug), variant_slug,
+                              display_name)
+        memgraph_large_configurations.append(
+            (display_name, config['variant_large_file_memgraph']))
+
+    create_all_large_resource_charts(
+        neo4j_large_configurations, os.path.join(output_dir, 'neo4j'), 'neo4j_all_large')
+    create_all_large_resource_charts(
+        memgraph_large_configurations, os.path.join(output_dir, 'memgraph'), 'memgraph_all_large')
 
 if __name__ == "__main__":
     # Check if baseline files exist
@@ -425,41 +587,53 @@ if __name__ == "__main__":
     configs = [
         {
             'variant_name': 'Transitive',
-            'variant_small_file': 'results_research_transitive_opt_neo4j_small.json',
-            'variant_large_file': 'results_research_transitive_opt_neo4j_large.json'
+            'variant_small_file_neo4j': 'results_research_transitive_opt_neo4j_small.json',
+            'variant_large_file_neo4j': 'results_research_transitive_opt_neo4j_large.json',
+            'variant_small_file_memgraph': 'results_research_transitive_opt_memgraph_small.json',
+            'variant_large_file_memgraph': 'results_research_transitive_opt_memgraph_large.json',
+            'variant_extra_file': 'results_research_transitive_opt_neo4j_extra.json'
         },
         {
             'variant_name': 'Uplift',
-            'variant_small_file': 'results_research_uplift_opt_neo4j_small.json',
-            'variant_large_file': 'results_research_uplift_opt_neo4j_large.json'
+            'variant_small_file_neo4j': 'results_research_uplift_opt_neo4j_small.json',
+            'variant_large_file_neo4j': 'results_research_uplift_opt_neo4j_large.json',
+            'variant_small_file_memgraph': 'results_research_uplift_opt_memgraph_small.json',
+            'variant_large_file_memgraph': 'results_research_uplift_opt_memgraph_large.json'
         },
         {
             'variant_name': 'Denormalized',
-            'variant_small_file': 'results_research_denormalized_opt_neo4j_small.json',
-            'variant_large_file': 'results_research_denormalized_opt_neo4j_large.json'
+            'variant_small_file_neo4j': 'results_research_denormalized_opt_neo4j_small.json',
+            'variant_large_file_neo4j': 'results_research_denormalized_opt_neo4j_large.json',
+            'variant_small_file_memgraph': 'results_research_denormalized_opt_memgraph_small.json',
+            'variant_large_file_memgraph': 'results_research_denormalized_opt_memgraph_large.json',
+            'variant_extra_file': 'results_research_denormalized_opt_neo4j_extra.json'
         },
         {
             'variant_name': 'Intermediate',
-            'variant_small_file': 'results_research_intermediate_opt_neo4j_small.json',
-            'variant_large_file': 'results_research_intermediate_opt_neo4j_large.json'
+            'variant_small_file_neo4j': 'results_research_intermediate_opt_neo4j_small.json',
+            'variant_large_file_neo4j': 'results_research_intermediate_opt_neo4j_large.json',
+            'variant_small_file_memgraph': 'results_research_intermediate_opt_memgraph_small.json',
+            'variant_large_file_memgraph': 'results_research_intermediate_opt_memgraph_large.json',
+            'variant_extra_file': 'results_research_intermediate_opt_neo4j_extra.json'
         }
     ]
     
     # Check which variant files exist
     valid_configs = []
     for config in configs:
-        small_exists = os.path.exists(config['variant_small_file'])
-        large_exists = os.path.exists(config['variant_large_file'])
+        required_files = [
+            config['variant_small_file_neo4j'], config['variant_large_file_neo4j'],
+            config['variant_small_file_memgraph'], config['variant_large_file_memgraph']
+        ]
+        missing_files = [file_path for file_path in required_files if not os.path.exists(file_path)]
         
-        if small_exists and large_exists:
+        if not missing_files:
             valid_configs.append(config)
             print(f"✓ Found {config['variant_name']} files")
         else:
             print(f"✗ Skipping {config['variant_name']} - files not found")
-            if not small_exists:
-                print(f"    Missing: {config['variant_small_file']}")
-            if not large_exists:
-                print(f"    Missing: {config['variant_large_file']}")
+            for file_path in missing_files:
+                print(f"    Missing: {file_path}")
     
     if not valid_configs:
         print("\nNo valid variant configurations found. Please check your file paths.")
