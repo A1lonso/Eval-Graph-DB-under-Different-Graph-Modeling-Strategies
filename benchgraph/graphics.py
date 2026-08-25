@@ -1,7 +1,6 @@
 import json
 import matplotlib.pyplot as plt
 import numpy as np
-from pathlib import Path
 import os
 
 def detect_top_level_key(data):
@@ -42,6 +41,14 @@ def extract_query_metrics(file_path):
     """
     with open(file_path, 'r') as f:
         data = json.load(f)
+
+    vendor = data.get('__run_configuration__', {}).get('vendor')
+    file_name = os.path.basename(file_path).lower()
+    expected_vendor = 'memgraph' if 'memgraph' in file_name else 'neo4j' if 'neo4j' in file_name else None
+    if expected_vendor and (vendor is None or expected_vendor not in vendor.lower()):
+        raise ValueError(
+            f"Vendor mismatch in {file_path}: filename expects {expected_vendor}, recorded vendor is {vendor!r}"
+        )
     
     # Detect the top-level key
     top_key = detect_top_level_key(data)
@@ -90,8 +97,8 @@ def extract_query_metrics(file_path):
                         durations[q_key] = query_data['latency_stats']['mean']
                         throughputs[q_key] = query_data['throughput']
                         database = query_data.get('database', {})
-                        cpu_usage[q_key] = database.get('cpu', 0)
-                        memory_usage[q_key] = database.get('memory', 0)
+                        cpu_usage[q_key] = database['cpu'] / query_data['count']
+                        memory_usage[q_key] = database['memory']
                         found = True
                         break
                     except KeyError:
@@ -103,14 +110,12 @@ def extract_query_metrics(file_path):
                 durations[q_key] = query_data['latency_stats']['mean']
                 throughputs[q_key] = query_data['throughput']
                 database = query_data.get('database', {})
-                cpu_usage[q_key] = database.get('cpu', 0)
-                memory_usage[q_key] = database.get('memory', 0)
-        except KeyError as e:
-            print(f"Warning: Could not find metrics for {q_key} ({query_name}) in {file_path}")
-            durations[q_key] = None
-            throughputs[q_key] = None
-            cpu_usage[q_key] = None
-            memory_usage[q_key] = None
+                cpu_usage[q_key] = database['cpu'] / query_data['count']
+                memory_usage[q_key] = database['memory']
+        except (KeyError, TypeError, ZeroDivisionError) as e:
+            raise ValueError(
+                f"Missing or invalid metrics for {q_key} ({query_name}) in {file_path}"
+            ) from e
     
     return durations, throughputs, cpu_usage, memory_usage
 
@@ -166,11 +171,13 @@ def create_comparison_charts(baseline_small_file, baseline_large_file,
     
     # Collect metrics for each group
     def prepare_metrics(dur_dict, tput_dict):
+        if dur_dict is None or tput_dict is None:
+            raise ValueError('Cannot plot a comparison series without query metrics')
         dur_values = []
         tput_values = []
         for q in queries:
-            dur_values.append(dur_dict.get(q, 0) if dur_dict else 0)
-            tput_values.append(tput_dict.get(q, 0) if tput_dict else 0)
+            dur_values.append(dur_dict[q])
+            tput_values.append(tput_dict[q])
         return dur_values, tput_values
     
     baseline_small_dur_vals, baseline_small_tput_vals = prepare_metrics(baseline_small_dur, baseline_small_tput)
@@ -333,8 +340,8 @@ def create_large_resource_charts(baseline_large_file, configs, output_dir="chart
         _, _, cpu_usage, memory_usage = extract_query_metrics(file_path)
         resource_data.append({
             'name': name,
-            'cpu': [cpu_usage.get(query, 0) or 0 for query in queries],
-            'memory': [memory_usage.get(query, 0) / 1024**2 for query in queries]
+            'cpu': [cpu_usage[query] for query in queries],
+            'memory': [memory_usage[query] / 1024**2 for query in queries]
         })
 
     if not resource_data:
@@ -370,9 +377,9 @@ def create_large_resource_charts(baseline_large_file, configs, output_dir="chart
         plt.close(fig)
 
     create_resource_chart(
-        'cpu', 'CPU Usage (%) - Logarithmic Scale',
-        'CPU Usage Comparison - All Large Configurations',
-        'cpu_usage_comparison_all_large.png', lambda value: f'{value:.1f}%')
+        'cpu', 'CPU Time per Query (seconds) - Logarithmic Scale',
+        'CPU Time per Query Comparison',
+        'cpu_usage_comparison_all_large.png', lambda value: f'{value:.4f}s')
     create_resource_chart(
         'memory', 'Memory Usage (MiB) - Logarithmic Scale',
         'Memory Usage Comparison - All Large Configurations',
@@ -445,7 +452,7 @@ def create_dataset_charts(configurations, output_dir, filename_prefix, display_n
         large_loaded = [configuration for configuration in loaded if '(Large)' in configuration['name']]
         if not large_loaded:
             raise ValueError(f'No Large result files found for {filename_prefix}')
-        create_chart('cpu', 'CPU Usage (%) - Logarithmic Scale',
+        create_chart('cpu', 'CPU Time per Query (seconds) - Logarithmic Scale',
                      display_name, 'cpu_usage',
                      lambda value: f'{value:.1f}%', large_loaded)
         create_chart('memory', 'Memory Usage (MiB) - Logarithmic Scale',
@@ -468,8 +475,8 @@ def create_all_large_resource_charts(configurations, output_dir, filename_prefix
         _, _, cpu, memory = extract_query_metrics(file_path)
         resource_data.append({
             'name': name,
-            'cpu': [cpu.get(query) or 0 for query in queries],
-            'memory': [(memory.get(query) or 0) / 1024**2 for query in queries]
+            'cpu': [cpu[query] for query in queries],
+            'memory': [memory[query] / 1024**2 for query in queries]
         })
 
     if not resource_data:
@@ -479,8 +486,6 @@ def create_all_large_resource_charts(configurations, output_dir, filename_prefix
     group_width = 0.8 / len(resource_data)
     width = min(group_width, 0.2)
     resource_colors = ['#2E86C1', '#E74C3C', '#27AE60', '#F39C12', '#8E44AD', '#16A085']
-    readable_name = filename_prefix.replace('_', ' ').title()
-
     def create_resource_chart(metric, ylabel, title, suffix, formatter, logarithmic=True):
         fig, ax = plt.subplots(figsize=(16, 9))
         for index, configuration in enumerate(resource_data):
@@ -505,9 +510,9 @@ def create_all_large_resource_charts(configurations, output_dir, filename_prefix
         print(f"Chart saved as: {output_path}")
         plt.close(fig)
 
-    create_resource_chart('cpu', 'CPU Usage',
-                          'CPU Usage Comparison', 'cpu_usage',
-                          lambda value: f'{value:.1f}%')
+    create_resource_chart('cpu', 'CPU Time per Query (seconds)',
+                          'CPU Time per Query Comparison', 'cpu_time_per_query',
+                          lambda value: f'{value:.4f}s')
     create_resource_chart('memory', 'Memory Usage (MiB)',
                           'Memory Usage Comparison', 'memory_usage',
                           lambda value: f'{value / 1024:.1f}GiB' if value >= 1024 else f'{value:.0f}MiB',

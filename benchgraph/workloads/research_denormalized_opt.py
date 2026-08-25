@@ -12,12 +12,24 @@
 import numpy as np
 from workloads.base import Workload
 import gc
+import time
 
 class ResearchDenormalizedOpt(Workload):
     NAME = "research_denormalized_opt"
     dataset_seed = 42
 
+    # Configurable batch sizes - optimized for performance
+    BATCH_SIZES = {
+        'people': 15000,        # Increased from 4000
+        'movies': 8000,         # Increased from 2000
+        'connections': 3000,    # Increased from 2000
+        'relationships': 8000   # Increased from 250
+    }
+
     def indexes_generator(self):
+        print("\n" + "="*80)
+        print("INDEXES: Creating database indexes...")
+        print("="*80)
         indexes = []
         if "neo4j" in self.benchmark_context.vendor_name:
             indexes.extend([
@@ -35,6 +47,7 @@ class ResearchDenormalizedOpt(Workload):
                 ("CREATE INDEX FOR (l:Language) ON (l.avg_revenue);", {}),
                 ("CREATE INDEX FOR (s:Studio) ON (s.avg_budget, s.total_revenue);", {}),
             ])
+            print(f"  ✓ Creating {len(indexes)} Neo4j indexes")
         else:
             indexes.extend([
                 ("CREATE INDEX ON :Person(id);", {}),
@@ -51,11 +64,18 @@ class ResearchDenormalizedOpt(Workload):
                 ("CREATE INDEX ON :Language(avg_revenue);", {}),
                 ("CREATE INDEX ON :Studio(avg_budget, total_revenue);", {}),
             ])
+            print(f"  ✓ Creating {len(indexes)} Memgraph indexes")
+        print("="*80 + "\n")
         return indexes
 
     def dataset_generator(self):
+        print("\n" + "="*80)
+        print("DATASET GENERATION STARTED")
+        print("="*80)
+        
+        start_time = time.time()
         np.random.seed(self.dataset_seed)
-        scale = 10
+        scale = 20
         
         studios = [f"Studio_{i}" for i in range(50)]
         genres = ["Action", "Comedy", "Drama", "Sci-Fi", "Horror", "Romance", "Thriller"]
@@ -64,10 +84,25 @@ class ResearchDenormalizedOpt(Workload):
         awards = ["Oscar", "Golden_Globe", "BAFTA", "Cannes"]
         
         total_people = 20000 * scale
+        total_movies = 8000 * scale
+        total_relationships = 100000 * scale
+        
+        print(f"\n📊 Dataset Statistics (scale={scale}):")
+        print(f"  • People: {total_people:,}")
+        print(f"  • Movies: {total_movies:,}")
+        print(f"  • Relationships: {total_relationships:,}")
+        print(f"  • Studios: {len(studios)}")
+        print(f"  • Genres: {len(genres)}")
+        print(f"  • Languages: {len(languages)}")
+        print(f"  • Countries: {len(countries)}")
+        print(f"  • Awards: {len(awards)}")
+        print("="*80)
 
         weights_array = np.power((total_people - np.arange(total_people)).astype(np.float64), 0.7)
         
         # Batch: Create studios
+        print("\n🏢 STUDIOS: Creating studios...")
+        studio_start = time.time()
         studio_queries = []
         for i, studio in enumerate(studios):
             studio_queries.append((
@@ -76,8 +111,11 @@ class ResearchDenormalizedOpt(Workload):
                  "country": np.random.choice(countries)}
             ))
         yield studio_queries
+        print(f"  ✓ Created {len(studios)} studios in {time.time() - studio_start:.2f}s")
         
         # Batch: Create genres
+        print("\n🎭 GENRES: Creating genres...")
+        genre_start = time.time()
         genre_queries = []
         for genre in genres:
             genre_queries.append((
@@ -85,8 +123,11 @@ class ResearchDenormalizedOpt(Workload):
                 {"name": genre}
             ))
         yield genre_queries
+        print(f"  ✓ Created {len(genres)} genres in {time.time() - genre_start:.2f}s")
         
         # Batch: Create languages 
+        print("\n🌐 LANGUAGES: Creating languages...")
+        lang_start = time.time()
         lang_queries = []
         for lang in languages:
             lang_queries.append((
@@ -94,8 +135,11 @@ class ResearchDenormalizedOpt(Workload):
                 {"code": lang, "name": f"Language_{lang}"}
             ))
         yield lang_queries
+        print(f"  ✓ Created {len(languages)} languages in {time.time() - lang_start:.2f}s")
         
         # Batch: Create awards
+        print("\n🏆 AWARDS: Creating awards...")
+        award_start = time.time()
         award_queries = []
         for award in awards:
             award_queries.append((
@@ -103,18 +147,27 @@ class ResearchDenormalizedOpt(Workload):
                 {"name": award, "prestige": int(np.random.randint(1, 100))}
             ))
         yield award_queries
+        print(f"  ✓ Created {len(awards)} awards in {time.time() - award_start:.2f}s")
         
-        # Batch: Create people em batches
-        people_per_batch = 4000
+        # Batch: Create people in batches - INCREASED BATCH SIZE
+        people_per_batch = self.BATCH_SIZES['people']
         num_people_batches = int(np.ceil(total_people / people_per_batch))
+        
+        print(f"\n👤 PEOPLE: Creating {total_people:,} people in {num_people_batches} batches of {people_per_batch:,}")
+        print("-" * 60)
 
         top_1_percent = int(0.01 * total_people)
         top_10_percent = int(0.1 * total_people)
 
+        people_start = time.time()
         for batch_num in range(num_people_batches):
+            batch_start_time = time.time()
             people_queries = []
             batch_start = batch_num * people_per_batch
             batch_end = min(batch_start + people_per_batch, total_people)
+            batch_size = batch_end - batch_start
+            
+            print(f"  Batch {batch_num + 1:>3}/{num_people_batches}: People {batch_start:>7,} to {batch_end:>7,} ({batch_size:>5,} people) ", end="", flush=True)
             
             for i in range(batch_start, batch_end):
                 if i < top_1_percent:
@@ -130,19 +183,35 @@ class ResearchDenormalizedOpt(Workload):
                      "year": int(np.random.randint(1940, 2000)), "pop": popularity}
                 ))
             yield people_queries
+            
+            batch_time = time.time() - batch_start_time
+            print(f"✓ {batch_time:.2f}s")
+            
+            # Periodic garbage collection for large batches
+            if batch_num % 10 == 0:
+                gc.collect()
         
-        # Batch: Create movies em batches
-        movies_per_batch = 2000
-        total_movies = 8000 * scale
+        print(f"  ✓ Total people creation time: {time.time() - people_start:.2f}s")
+        
+        # Batch: Create movies in batches - INCREASED BATCH SIZE
+        movies_per_batch = self.BATCH_SIZES['movies']
         num_movie_batches = int(np.ceil(total_movies / movies_per_batch))
+        
+        print(f"\n🎬 MOVIES: Creating {total_movies:,} movies in {num_movie_batches} batches of {movies_per_batch:,}")
+        print("-" * 60)
         
         top_1_percent_movies = int(0.01 * total_movies)
         top_10_percent_movies = int(0.10 * total_movies)
 
+        movies_start = time.time()
         for batch_num in range(num_movie_batches):
+            batch_start_time = time.time()
             movie_queries = []
             batch_start = batch_num * movies_per_batch
             batch_end = min(batch_start + movies_per_batch, total_movies)
+            batch_size = batch_end - batch_start
+            
+            print(f"  Batch {batch_num + 1:>3}/{num_movie_batches}: Movies {batch_start:>7,} to {batch_end:>7,} ({batch_size:>5,} movies) ", end="", flush=True)
             
             for i in range(batch_start, batch_end):
                 year = int(np.random.randint(1980, 2023))
@@ -164,14 +233,32 @@ class ResearchDenormalizedOpt(Workload):
                      "runtime": int(np.random.randint(70, 210)), "votes": int(np.random.randint(1000, 1000000))}
                 ))
             yield movie_queries
+            
+            batch_time = time.time() - batch_start_time
+            print(f"✓ {batch_time:.2f}s")
+            
+            # Periodic garbage collection
+            if batch_num % 10 == 0:
+                gc.collect()
         
-        connections_per_batch = 2000
+        print(f"  ✓ Total movies creation time: {time.time() - movies_start:.2f}s")
+        
+        # Batch: Creates the connections between movies and other nodes - INCREASED BATCH SIZE
+        connections_per_batch = self.BATCH_SIZES['connections']
         num_connection_batches = int(np.ceil(total_movies / connections_per_batch))
         
+        print(f"\n🔗 CONNECTIONS: Creating connections for {total_movies:,} movies in {num_connection_batches} batches of {connections_per_batch:,}")
+        print("-" * 60)
+        
+        connections_start = time.time()
         for batch_num in range(num_connection_batches):
+            batch_start_time = time.time()
             connection_queries = []
             batch_start = batch_num * connections_per_batch
             batch_end = min(batch_start + connections_per_batch, total_movies)
+            batch_size = batch_end - batch_start
+            
+            print(f"  Batch {batch_num + 1:>3}/{num_connection_batches}: Movies {batch_start:>7,} to {batch_end:>7,} ({batch_size:>5,} movies) ", end="", flush=True)
             
             for i in range(batch_start, batch_end):
                 studio_weights = np.array([50 if j < 5 else 1 for j in range(50)])
@@ -204,19 +291,34 @@ class ResearchDenormalizedOpt(Workload):
                             {"id": i, "award": np.random.choice(awards), "year": award_year}
                         ))
             yield connection_queries
+            
+            batch_time = time.time() - batch_start_time
+            print(f"✓ {batch_time:.2f}s ({len(connection_queries):,} queries)")
+            
+            # Periodic garbage collection
+            if batch_num % 10 == 0:
+                gc.collect()
         
-        # Batch: Create relacionamentos entre pessoas e filmes em batches
-        relationships_per_batch = 250
-        total_relationships = 100000 * scale
+        print(f"  ✓ Total connections creation time: {time.time() - connections_start:.2f}s")
+        
+        # Batch: Create relationships - SIGNIFICANTLY INCREASED BATCH SIZE
+        relationships_per_batch = self.BATCH_SIZES['relationships']
         num_relationship_batches = int(np.ceil(total_relationships / relationships_per_batch))
 
-        print("Generating relationships with memory-efficient streaming...")
+        print(f"\n🔗 RELATIONSHIPS: Generating {total_relationships:,} relationships")
+        print(f"  • {num_relationship_batches} batches of {relationships_per_batch:,} relationships each")
+        print("-" * 60)
 
+        relationships_start = time.time()
+        role_counts = {"ACTOR": 0, "DIRECTOR": 0, "PRODUCER": 0, "WRITER": 0, "COMPOSER": 0}
+        
         for batch_num in range(num_relationship_batches):
+            batch_start_time = time.time()
             batch_start = batch_num * relationships_per_batch
             batch_end = min(batch_start + relationships_per_batch, total_relationships)
+            batch_size = batch_end - batch_start
 
-            print(f"Batch {batch_num + 1}/{num_relationship_batches} - Relations {batch_start} to {batch_end}")
+            print(f"  Batch {batch_num + 1:>3}/{num_relationship_batches}: Relations {batch_start:>7,} to {batch_end:>7,} ({batch_size:>5,} relations) ", end="", flush=True)
 
             role_data = {"ACTOR": [], "DIRECTOR": [], "PRODUCER": [], "WRITER": [], "COMPOSER": []}
             
@@ -227,6 +329,7 @@ class ResearchDenormalizedOpt(Workload):
                 ))
                 
                 role_type = np.random.choice(["ACTOR", "DIRECTOR", "PRODUCER", "WRITER", "COMPOSER"])
+                role_counts[role_type] += 1
                 movie_id = int(np.random.randint(0, total_movies - 1))
                 
                 base_salary = {
@@ -326,16 +429,29 @@ class ResearchDenormalizedOpt(Workload):
             
             yield relationship_queries
             
+            batch_time = time.time() - batch_start_time
+            queries_count = len(relationship_queries)
+            total_relations_in_batch = sum(len(data) for data in role_data.values())
+            print(f"✓ {batch_time:.2f}s ({queries_count} UNWIND queries, {total_relations_in_batch:,} relations)")
+            
+            # Clean up to free memory
             del role_data
             del relationship_queries
 
-            if batch_num % 25 == 0:
+            # More frequent garbage collection for larger batches
+            if batch_num % 5 == 0:
                 gc.collect()
-
-        print("Computing REAL denormalized statistics...")
         
+        print(f"  ✓ Total relationships creation time: {time.time() - relationships_start:.2f}s")
+
+        print("\n" + "="*80)
+        print("📊 COMPUTING DENORMALIZED STATISTICS")
+        print("="*80)
+        
+        denorm_start = time.time()
         denormalization_queries = []
 
+        print("  • Computing Person statistics (ACTED_IN relationships)...")
         denormalization_queries.append((
             """MATCH (p:Person)-[r:ACTED_IN]->(:Movie)
             WITH p,
@@ -351,7 +467,9 @@ class ResearchDenormalizedOpt(Workload):
                 p.avg_lead_salary = avg_lead_salary;""",
             {}
         ))
+        print("  ✓ Person statistics query prepared")
 
+        print("  • Computing Genre statistics...")
         denormalization_queries.append((
             """MATCH (g:Genre)<-[:HAS_GENRE]-(m:Movie)
             WITH g, 
@@ -367,7 +485,9 @@ class ResearchDenormalizedOpt(Workload):
                 g.total_revenue = total_revenue;""",
             {}
         ))
+        print("  ✓ Genre statistics query prepared")
 
+        print("  • Computing Language statistics...")
         denormalization_queries.append((
             """MATCH (l:Language)<-[:IN_LANGUAGE]-(m:Movie)
             WITH l,
@@ -381,7 +501,9 @@ class ResearchDenormalizedOpt(Workload):
                 l.avg_budget = avg_budget;""",
             {}
         ))
+        print("  ✓ Language statistics query prepared")
 
+        print("  • Computing Studio statistics...")
         denormalization_queries.append((
             """MATCH (s:Studio)<-[:PRODUCED_BY]-(m:Movie)
             WITH s,
@@ -397,7 +519,9 @@ class ResearchDenormalizedOpt(Workload):
                 s.avg_rating = avg_rating;""",
             {}
         ))
+        print("  ✓ Studio statistics query prepared")
 
+        print("  • Computing Director statistics...")
         denormalization_queries.append((
             """MATCH (p:Person)-[r:DIRECTED]->(:Movie)
             WITH p,
@@ -409,14 +533,35 @@ class ResearchDenormalizedOpt(Workload):
                 p.max_directing_salary = max_directing_salary;""",
             {}
         ))
+        print("  ✓ Director statistics query prepared")
 
         yield denormalization_queries
+        
+        print(f"  ✓ All denormalization queries completed in {time.time() - denorm_start:.2f}s")
 
-        print("Denormalized statistics computation completed!")
+        # Final summary
+        total_time = time.time() - start_time
+        print("\n" + "="*80)
+        print("✅ DATASET GENERATION COMPLETE")
+        print("="*80)
+        print(f"  • Total time: {total_time:.2f}s")
+        print(f"  • People: {total_people:,}")
+        print(f"  • Movies: {total_movies:,}")
+        print(f"  • Relationships: {total_relationships:,}")
+        print(f"  • Batches processed: {num_people_batches + num_movie_batches + num_connection_batches + num_relationship_batches}")
+        print(f"\n📊 Relationship breakdown:")
+        print(f"  • ACTOR: {role_counts['ACTOR']:,}")
+        print(f"  • DIRECTOR: {role_counts['DIRECTOR']:,}")
+        print(f"  • PRODUCER: {role_counts['PRODUCER']:,}")
+        print(f"  • WRITER: {role_counts['WRITER']:,}")
+        print(f"  • COMPOSER: {role_counts['COMPOSER']:,}")
+        print("="*80 + "\n")
 
     def benchmark__test__strong_collaboration_clusters(self):
         """SEM FECHO: Mesma lógica mas MUITO mais complexa"""
         min_collaborations = 2
+        print("\n🔍 Running: Strong Collaboration Clusters")
+        print(f"  • min_collaborations: {min_collaborations}")
         return ("""
         // Para simular triângulo com colaborações fortes (>= 2 filmes juntos)
         
@@ -451,6 +596,11 @@ class ResearchDenormalizedOpt(Workload):
         min_year = 2008
         min_rating = 7.2
         
+        print("\n🔍 Running: Complex Categorical Analytics")
+        print(f"  • target_genres: {target_genres}")
+        print(f"  • min_year: {min_year}")
+        print(f"  • min_rating: {min_rating}")
+        
         return ("""
         // Complex multi-category business intelligence query
         MATCH (m:Movie)
@@ -474,6 +624,7 @@ class ResearchDenormalizedOpt(Workload):
         """, {"min_year": min_year, "min_rating": min_rating, "genres": target_genres})
 
     def benchmark__test__cross_role_workforce_analysis(self):
+        print("\n🔍 Running: Cross-Role Workforce Analysis")
         return ("""
         // Análise dos principais salários por função
         MATCH (p:Person)-[r:ACTED_IN]->(m:Movie)
@@ -497,6 +648,10 @@ class ResearchDenormalizedOpt(Workload):
     def benchmark__test__relationship_property_mining(self):
         """OTIMIZADA: Usa dados desnormalizados"""
         min_salary = 1500000
+        
+        print("\n🔍 Running: Relationship Property Mining (Optimized)")
+        print(f"  • min_salary: ${min_salary:,}")
+        
         return ("""
         // RÁPIDA: Usa índices em propriedades desnormalizadas
         MATCH (p:Person)
@@ -513,6 +668,9 @@ class ResearchDenormalizedOpt(Workload):
     def benchmark__test__workforce_salary_analytics(self):
         """Analytics salariais da força de trabalho - SEM índices em relationships"""
         min_salary = 1000000
+        
+        print("\n🔍 Running: Workforce Salary Analytics")
+        print(f"  • min_salary: ${min_salary:,}")
         
         return ("""
         // Analytics complexas sem índices - requer scan
@@ -531,6 +689,7 @@ class ResearchDenormalizedOpt(Workload):
     
     def benchmark__test__denormalized_genre_performance(self):
         """OTIMIZADA: Query que USA dados desnormalizados REAIS em Genre"""
+        print("\n🔍 Running: Denormalized Genre Performance (Optimized)")
         return ("""
         // RÁPIDA: Dados pré-computados com índices
         MATCH (g:Genre)
@@ -543,6 +702,7 @@ class ResearchDenormalizedOpt(Workload):
     
     def benchmark__test__complex_country_network_base(self):
         """BASE VERSION - Complex country-based network analysis using property scans"""
+        print("\n🔍 Running: Complex Country Network Base")
         return ("""
         // Find countries with strong domestic collaboration networks
         MATCH (p1:Person)-[:ACTED_IN]->(m:Movie)<-[:ACTED_IN]-(p2:Person)

@@ -12,12 +12,24 @@
 import numpy as np
 from workloads.base import Workload
 import gc
+import time
 
 class ResearchUpliftOpt(Workload):
     NAME = "research_uplift_opt"
     dataset_seed = 42
 
+    # Configurable batch sizes - optimized for performance
+    BATCH_SIZES = {
+        'people': 15000,           # Increased from 4000
+        'movies': 8000,            # Increased from 2000
+        'connections': 3000,       # Increased from 2000
+        'relationships': 8000      # Increased from 250
+    }
+
     def indexes_generator(self):
+        print("\n" + "="*80)
+        print("INDEXES: Creating database indexes...")
+        print("="*80)
         indexes = []
         if "neo4j" in self.benchmark_context.vendor_name:
             indexes.extend([
@@ -33,6 +45,7 @@ class ResearchUpliftOpt(Workload):
                 ("CREATE INDEX FOR (c:Country) ON (c.code);", {}),
                 ("CREATE INDEX FOR (c:Country) ON (c.region);", {}),
             ])
+            print(f"  ✓ Creating {len(indexes)} Neo4j indexes")
         else:
             indexes.extend([
                 ("CREATE INDEX ON :Person(id);", {}),
@@ -47,11 +60,18 @@ class ResearchUpliftOpt(Workload):
                 ("CREATE INDEX ON :Country(code);", {}),
                 ("CREATE INDEX ON :Country(region);", {}),
             ])
+            print(f"  ✓ Creating {len(indexes)} Memgraph indexes")
+        print("="*80 + "\n")
         return indexes
 
     def dataset_generator(self):
+        print("\n" + "="*80)
+        print("DATASET GENERATION STARTED")
+        print("="*80)
+        
+        start_time = time.time()
         np.random.seed(self.dataset_seed)
-        scale = 10
+        scale = 1
         
         studios = [f"Studio_{i}" for i in range(50)]
         genres = ["Action", "Comedy", "Drama", "Sci-Fi", "Horror", "Romance", "Thriller"]
@@ -60,8 +80,25 @@ class ResearchUpliftOpt(Workload):
         awards = ["Oscar", "Golden_Globe", "BAFTA", "Cannes"]
         
         total_people = 20000 * scale
+        total_movies = 8000 * scale
+        total_relationships = 100000 * scale
+        
+        print(f"\n📊 Dataset Statistics (scale={scale}):")
+        print(f"  • People: {total_people:,}")
+        print(f"  • Movies: {total_movies:,}")
+        print(f"  • Relationships: {total_relationships:,}")
+        print(f"  • Studios: {len(studios)}")
+        print(f"  • Genres: {len(genres)}")
+        print(f"  • Languages: {len(languages)}")
+        print(f"  • Countries: {len(countries)}")
+        print(f"  • Awards: {len(awards)}")
+        print("="*80)
+
         weights_array = np.power((total_people - np.arange(total_people)).astype(np.float64), 0.7)
         
+        # Batch: Create Country nodes (property uplifting)
+        print("\n🌍 COUNTRIES: Creating Country nodes with regions...")
+        country_start = time.time()
         country_queries = []
         regions = {"US": "NA", "UK": "EU", "FR": "EU", "DE": "EU", "JP": "AS", 
                   "CA": "NA", "AU": "OC", "KR": "AS", "IT": "EU", "BR": "SA"}
@@ -72,13 +109,16 @@ class ResearchUpliftOpt(Workload):
                 {"code": country, "name": f"Country_{country}", "region": regions[country]}
             ))
         yield country_queries
+        print(f"  ✓ Created {len(countries)} Country nodes in {time.time() - country_start:.2f}s")
         
-        # Batch: Create studios
+        # Batch: Create studios with LOCATED_IN relationships
+        print("\n🏢 STUDIOS: Creating studios with LOCATED_IN relationships...")
+        studio_start = time.time()
         studio_queries = []
         for i, studio in enumerate(studios):
             country = np.random.choice(countries)
             studio_queries.append((
-                "CREATE (:Studio {id: $id, name: $name, founded: $year});",  # REMOVIDO country daqui
+                "CREATE (:Studio {id: $id, name: $name, founded: $year});",
                 {"id": i, "name": studio, "year": int(np.random.randint(1920, 2020))}
             ))
             studio_queries.append((
@@ -86,38 +126,56 @@ class ResearchUpliftOpt(Workload):
                 {"id": i, "code": country}
             ))
         yield studio_queries
+        print(f"  ✓ Created {len(studios)} studios with LOCATED_IN relationships in {time.time() - studio_start:.2f}s")
         
         # Batch: Create genres
+        print("\n🎭 GENRES: Creating genres...")
+        genre_start = time.time()
         genre_queries = []
         for genre in genres:
             genre_queries.append(("CREATE (:Genre {name: $name});", {"name": genre}))
         yield genre_queries
+        print(f"  ✓ Created {len(genres)} genres in {time.time() - genre_start:.2f}s")
         
         # Batch: Create languages
+        print("\n🌐 LANGUAGES: Creating languages...")
+        lang_start = time.time()
         lang_queries = []
         for lang in languages:
             lang_queries.append(("CREATE (:Language {code: $code, name: $name});", 
                               {"code": lang, "name": f"Language_{lang}"}))
         yield lang_queries
+        print(f"  ✓ Created {len(languages)} languages in {time.time() - lang_start:.2f}s")
         
         # Batch: Create awards
+        print("\n🏆 AWARDS: Creating awards...")
+        award_start = time.time()
         award_queries = []
         for award in awards:
             award_queries.append(("CREATE (:Award {name: $name, prestige: $prestige});", 
                                 {"name": award, "prestige": int(np.random.randint(1, 100))}))
         yield award_queries
+        print(f"  ✓ Created {len(awards)} awards in {time.time() - award_start:.2f}s")
         
-        # Batch: Create people em batches
-        people_per_batch = 4000
+        # Batch: Create people with FROM_COUNTRY relationships - INCREASED BATCH SIZE
+        people_per_batch = self.BATCH_SIZES['people']
         num_people_batches = int(np.ceil(total_people / people_per_batch))
+        
+        print(f"\n👤 PEOPLE: Creating {total_people:,} people with FROM_COUNTRY relationships in {num_people_batches} batches of {people_per_batch:,}")
+        print("-" * 60)
 
         top_1_percent = int(0.01 * total_people)
         top_10_percent = int(0.1 * total_people)
 
+        people_start = time.time()
         for batch_num in range(num_people_batches):
+            batch_start_time = time.time()
             people_queries = []
             batch_start = batch_num * people_per_batch
             batch_end = min(batch_start + people_per_batch, total_people)
+            batch_size = batch_end - batch_start
+            
+            print(f"  Batch {batch_num + 1:>3}/{num_people_batches}: People {batch_start:>7,} to {batch_end:>7,} ({batch_size:>5,} people) ", end="", flush=True)
             
             for i in range(batch_start, batch_end):
                 if i < top_1_percent:
@@ -130,7 +188,7 @@ class ResearchUpliftOpt(Workload):
                 country = np.random.choice(countries)
                     
                 people_queries.append((
-                    "CREATE (:Person {id: $id, name: $name, birth_year: $year, popularity: $pop});",  # REMOVIDO country daqui
+                    "CREATE (:Person {id: $id, name: $name, birth_year: $year, popularity: $pop});",
                     {"id": i, "name": f"Person_{i}", 
                      "year": int(np.random.randint(1940, 2000)), "pop": popularity}
                 ))
@@ -139,19 +197,35 @@ class ResearchUpliftOpt(Workload):
                     {"id": i, "code": country}
                 ))
             yield people_queries
+            
+            batch_time = time.time() - batch_start_time
+            print(f"✓ {batch_time:.2f}s ({len(people_queries)} queries)")
+            
+            # Periodic garbage collection for large batches
+            if batch_num % 10 == 0:
+                gc.collect()
         
-        # Batch: Create movies em batches
-        movies_per_batch = 2000
-        total_movies = 8000 * scale
+        print(f"  ✓ Total people creation time: {time.time() - people_start:.2f}s")
+        
+        # Batch: Create movies in batches - INCREASED BATCH SIZE
+        movies_per_batch = self.BATCH_SIZES['movies']
         num_movie_batches = int(np.ceil(total_movies / movies_per_batch))
         
+        print(f"\n🎬 MOVIES: Creating {total_movies:,} movies in {num_movie_batches} batches of {movies_per_batch:,}")
+        print("-" * 60)
+        
         top_1_percent_movies = int(0.01 * total_movies)
-        top_10_percent_movies = int(0.10 * total_movies)  
+        top_10_percent_movies = int(0.10 * total_movies)
 
+        movies_start = time.time()
         for batch_num in range(num_movie_batches):
+            batch_start_time = time.time()
             movie_queries = []
             batch_start = batch_num * movies_per_batch
             batch_end = min(batch_start + movies_per_batch, total_movies)
+            batch_size = batch_end - batch_start
+            
+            print(f"  Batch {batch_num + 1:>3}/{num_movie_batches}: Movies {batch_start:>7,} to {batch_end:>7,} ({batch_size:>5,} movies) ", end="", flush=True)
             
             for i in range(batch_start, batch_end):
                 year = int(np.random.randint(1980, 2023))
@@ -173,15 +247,32 @@ class ResearchUpliftOpt(Workload):
                      "runtime": int(np.random.randint(70, 210)), "votes": int(np.random.randint(1000, 1000000))}
                 ))
             yield movie_queries
+            
+            batch_time = time.time() - batch_start_time
+            print(f"✓ {batch_time:.2f}s")
+            
+            # Periodic garbage collection
+            if batch_num % 10 == 0:
+                gc.collect()
         
-        # Batch: Cria as conexões entre filmes e outros nós em batches
-        connections_per_batch = 2000
+        print(f"  ✓ Total movies creation time: {time.time() - movies_start:.2f}s")
+        
+        # Batch: Create the connections between movies and other nodes - INCREASED BATCH SIZE
+        connections_per_batch = self.BATCH_SIZES['connections']
         num_connection_batches = int(np.ceil(total_movies / connections_per_batch))
         
+        print(f"\n🔗 CONNECTIONS: Creating connections for {total_movies:,} movies in {num_connection_batches} batches of {connections_per_batch:,}")
+        print("-" * 60)
+        
+        connections_start = time.time()
         for batch_num in range(num_connection_batches):
+            batch_start_time = time.time()
             connection_queries = []
             batch_start = batch_num * connections_per_batch
             batch_end = min(batch_start + connections_per_batch, total_movies)
+            batch_size = batch_end - batch_start
+            
+            print(f"  Batch {batch_num + 1:>3}/{num_connection_batches}: Movies {batch_start:>7,} to {batch_end:>7,} ({batch_size:>5,} movies) ", end="", flush=True)
             
             for i in range(batch_start, batch_end):
                 studio_weights = np.array([50 if j < 5 else 1 for j in range(50)])
@@ -214,21 +305,41 @@ class ResearchUpliftOpt(Workload):
                             {"id": i, "award": np.random.choice(awards), "year": award_year}
                         ))
             yield connection_queries
+            
+            batch_time = time.time() - batch_start_time
+            print(f"✓ {batch_time:.2f}s ({len(connection_queries):,} queries)")
+            
+            # Periodic garbage collection
+            if batch_num % 10 == 0:
+                gc.collect()
         
-        # Batch: Create relacionamentos entre pessoas e filmes
-        relationships_per_batch = 250
-        total_relationships = 100000 * scale
+        print(f"  ✓ Total connections creation time: {time.time() - connections_start:.2f}s")
+        
+        # Batch: Create relationships between people and movies - SIGNIFICANTLY INCREASED BATCH SIZE
+        relationships_per_batch = self.BATCH_SIZES['relationships']
         num_relationship_batches = int(np.ceil(total_relationships / relationships_per_batch))
 
+        print(f"\n🔗 RELATIONSHIPS: Generating {total_relationships:,} relationships")
+        print(f"  • {num_relationship_batches} batches of {relationships_per_batch:,} relationships each")
+        print("-" * 60)
+
+        relationships_start = time.time()
+        role_counts = {"ACTOR": 0, "DIRECTOR": 0, "PRODUCER": 0, "WRITER": 0, "COMPOSER": 0}
+        
         for batch_num in range(num_relationship_batches):
+            batch_start_time = time.time()
             batch_start = batch_num * relationships_per_batch
             batch_end = min(batch_start + relationships_per_batch, total_relationships)
+            batch_size = batch_end - batch_start
+
+            print(f"  Batch {batch_num + 1:>3}/{num_relationship_batches}: Relations {batch_start:>7,} to {batch_end:>7,} ({batch_size:>5,} relations) ", end="", flush=True)
 
             role_data = {"ACTOR": [], "DIRECTOR": [], "PRODUCER": [], "WRITER": [], "COMPOSER": []}
             
             for i in range(batch_start, batch_end):
                 person_id = int(np.random.choice(range(total_people), p=weights_array/np.sum(weights_array)))
                 role_type = np.random.choice(["ACTOR", "DIRECTOR", "PRODUCER", "WRITER", "COMPOSER"])
+                role_counts[role_type] += 1
                 movie_id = int(np.random.randint(0, total_movies - 1))
                 
                 base_salary = {
@@ -326,13 +437,45 @@ class ResearchUpliftOpt(Workload):
             
             yield relationship_queries
             
-            del role_data, relationship_queries
-            if batch_num % 25 == 0:
+            batch_time = time.time() - batch_start_time
+            queries_count = len(relationship_queries)
+            total_relations_in_batch = sum(len(data) for data in role_data.values())
+            print(f"✓ {batch_time:.2f}s ({queries_count} UNWIND queries, {total_relations_in_batch:,} relations)")
+            
+            # Clean up to free memory
+            del role_data
+            del relationship_queries
+
+            # More frequent garbage collection for larger batches
+            if batch_num % 5 == 0:
                 gc.collect()
+        
+        print(f"  ✓ Total relationships creation time: {time.time() - relationships_start:.2f}s")
+
+        # Final summary
+        total_time = time.time() - start_time
+        print("\n" + "="*80)
+        print("✅ DATASET GENERATION COMPLETE")
+        print("="*80)
+        print(f"  • Total time: {total_time:.2f}s")
+        print(f"  • People: {total_people:,}")
+        print(f"  • Movies: {total_movies:,}")
+        print(f"  • Relationships: {total_relationships:,}")
+        print(f"  • Countries: {len(countries)}")
+        print(f"  • Batches processed: {num_people_batches + num_movie_batches + num_connection_batches + num_relationship_batches}")
+        print(f"\n📊 Relationship breakdown:")
+        print(f"  • ACTOR: {role_counts['ACTOR']:,}")
+        print(f"  • DIRECTOR: {role_counts['DIRECTOR']:,}")
+        print(f"  • PRODUCER: {role_counts['PRODUCER']:,}")
+        print(f"  • WRITER: {role_counts['WRITER']:,}")
+        print(f"  • COMPOSER: {role_counts['COMPOSER']:,}")
+        print("="*80 + "\n")
     
     def benchmark__test__strong_collaboration_clusters(self):
         """SEM FECHO: Mesma lógica mas MUITO mais complexa"""
         min_collaborations = 2
+        print("\n🔍 Running: Strong Collaboration Clusters")
+        print(f"  • min_collaborations: {min_collaborations}")
         return ("""
         // Para simular triângulo com colaborações fortes (>= 3 filmes juntos)
         
@@ -367,6 +510,11 @@ class ResearchUpliftOpt(Workload):
         min_year = 2008 
         min_rating = 7.2
         
+        print("\n🔍 Running: Complex Categorical Analytics")
+        print(f"  • target_genres: {target_genres}")
+        print(f"  • min_year: {min_year}")
+        print(f"  • min_rating: {min_rating}")
+        
         return ("""
         // Complex multi-category business intelligence query
         MATCH (m:Movie)
@@ -390,6 +538,7 @@ class ResearchUpliftOpt(Workload):
         """, {"min_year": min_year, "min_rating": min_rating, "genres": target_genres})
 
     def benchmark__test__cross_role_workforce_analysis(self):
+        print("\n🔍 Running: Cross-Role Workforce Analysis")
         return ("""
         // Análise dos principais salários por função
         MATCH (p:Person)-[r:ACTED_IN]->(m:Movie)
@@ -414,6 +563,9 @@ class ResearchUpliftOpt(Workload):
         """Complex relationship property analysis - INEFFICIENT without indexing"""
         min_salary = 1500000
         
+        print("\n🔍 Running: Relationship Property Mining")
+        print(f"  • min_salary: ${min_salary:,}")
+        
         return ("""
         // Find high-paid lead actors and analyze their career patterns
         MATCH (p:Person)-[r:ACTED_IN]->(m:Movie)
@@ -437,6 +589,9 @@ class ResearchUpliftOpt(Workload):
         """Analytics salariais da força de trabalho - SEM índices em relationships"""
         min_salary = 1000000
         
+        print("\n🔍 Running: Workforce Salary Analytics")
+        print(f"  • min_salary: ${min_salary:,}")
+        
         return ("""
         // Analytics complexas sem índices - requer scan
         MATCH (p:Person)-[r]->(m:Movie)
@@ -454,6 +609,7 @@ class ResearchUpliftOpt(Workload):
     
     def benchmark__test__denormalized_genre_performance(self):
         """VERSÃO NORMALIZADA - Query equivalente mas sem desnormalização"""
+        print("\n🔍 Running: Denormalized Genre Performance (Normalized version)")
         return ("""
         // VERSÃO NORMALIZADA - Requer cálculo em tempo real
         MATCH (g:Genre)<-[:HAS_GENRE]-(m:Movie)
@@ -470,21 +626,26 @@ class ResearchUpliftOpt(Workload):
     
     def benchmark__test__complex_country_network_optimized(self):
         """OPTIMIZED VERSION - Uses Country nodes with indexes for fast lookups"""
+        print("\n🔍 Running: Complex Country Network (Optimized with Country nodes)")
         return ("""
         // Find countries with strong domestic collaboration networks
-        MATCH (c:Country)<-[:FROM_COUNTRY]-(p1:Person)-[:ACTED_IN]->(m:Movie)<-[:ACTED_IN]-(p2:Person)-[:FROM_COUNTRY]->(c)
-        // FAST: Same country constraint via node identity (uses index)
-        WITH c, 
-            COUNT(DISTINCT m) as domestic_movies,
-            COUNT(DISTINCT p1) as unique_actors
+        MATCH (c:Country)<-[:FROM_COUNTRY]-(p:Person)-[:ACTED_IN]->(m:Movie)
+        WITH c, m, COLLECT(DISTINCT p) as movie_actors
+        WHERE SIZE(movie_actors) >= 2
+        WITH c, COUNT(m) as domestic_movies, COLLECT(movie_actors) as actor_groups
+        UNWIND actor_groups as actors
+        UNWIND actors as actor
+        WITH c, domestic_movies, COUNT(DISTINCT actor) as unique_actors
         
         // Find cross-country collaborations using Country nodes
         MATCH (c)<-[:FROM_COUNTRY]-(p3:Person)-[:ACTED_IN]->(m2:Movie)<-[:ACTED_IN]-(p4:Person)-[:FROM_COUNTRY]->(c2:Country)
-        WHERE c2 <> c  // FAST: Different country nodes
-        
-        WITH c, domestic_movies, unique_actors,
-            COUNT(DISTINCT m2) as intl_movies,
-            COUNT(DISTINCT c2) as partner_countries
+        WHERE c2 <> c
+        WITH c, domestic_movies, unique_actors, m2, COLLECT(DISTINCT c2) as movie_partners
+        WITH c, domestic_movies, unique_actors, COUNT(DISTINCT m2) as intl_movies,
+            COLLECT(movie_partners) as partner_groups
+        UNWIND partner_groups as partners
+        UNWIND partners as partner
+        WITH c, domestic_movies, intl_movies, unique_actors, COUNT(DISTINCT partner) as partner_countries
         
         WHERE domestic_movies >= 100 
         AND intl_movies >= 50

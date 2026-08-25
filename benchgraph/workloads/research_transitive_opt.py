@@ -12,12 +12,25 @@
 import numpy as np
 from workloads.base import Workload
 import gc
+import time
 
 class ResearchTransitiveOpt(Workload):
     NAME = "research_transitive_opt"
     dataset_seed = 42
 
+    # Configurable batch sizes - optimized for performance
+    BATCH_SIZES = {
+        'people': 15000,           # Increased from 4000
+        'movies': 8000,            # Increased from 2000
+        'connections': 3000,       # Increased from 2000
+        'relationships': 8000,     # Increased from 250
+        'transitive': 500          # Increased from 200
+    }
+
     def indexes_generator(self):
+        print("\n" + "="*80)
+        print("INDEXES: Creating database indexes...")
+        print("="*80)
         indexes = []
         if "neo4j" in self.benchmark_context.vendor_name:
             indexes.extend([
@@ -30,6 +43,7 @@ class ResearchTransitiveOpt(Workload):
                 ("CREATE INDEX FOR (l:Language) ON (l.code);", {}),
                 ("CREATE INDEX FOR (a:Award) ON (a.name);", {}),
             ])
+            print(f"  ✓ Creating {len(indexes)} Neo4j indexes")
         else:
             indexes.extend([
                 ("CREATE INDEX ON :Person(id);", {}),
@@ -41,11 +55,18 @@ class ResearchTransitiveOpt(Workload):
                 ("CREATE INDEX ON :Language(code);", {}),
                 ("CREATE INDEX ON :Award(name);", {}),
             ])
+            print(f"  ✓ Creating {len(indexes)} Memgraph indexes")
+        print("="*80 + "\n")
         return indexes
     
     def dataset_generator(self):
+        print("\n" + "="*80)
+        print("DATASET GENERATION STARTED")
+        print("="*80)
+        
+        start_time = time.time()
         np.random.seed(self.dataset_seed)
-        scale = 10
+        scale = 20
         
         studios = [f"Studio_{i}" for i in range(50)]
         genres = ["Action", "Comedy", "Drama", "Sci-Fi", "Horror", "Romance", "Thriller"]
@@ -54,10 +75,25 @@ class ResearchTransitiveOpt(Workload):
         awards = ["Oscar", "Golden_Globe", "BAFTA", "Cannes"]
 
         total_people = 20000 * scale
+        total_movies = 8000 * scale
+        total_relationships = 100000 * scale
+        
+        print(f"\n📊 Dataset Statistics (scale={scale}):")
+        print(f"  • People: {total_people:,}")
+        print(f"  • Movies: {total_movies:,}")
+        print(f"  • Relationships: {total_relationships:,}")
+        print(f"  • Studios: {len(studios)}")
+        print(f"  • Genres: {len(genres)}")
+        print(f"  • Languages: {len(languages)}")
+        print(f"  • Countries: {len(countries)}")
+        print(f"  • Awards: {len(awards)}")
+        print("="*80)
 
         weights_array = np.power((total_people - np.arange(total_people)).astype(np.float64), 0.7)
         
         # Batch: Create studios
+        print("\n🏢 STUDIOS: Creating studios...")
+        studio_start = time.time()
         studio_queries = []
         for i, studio in enumerate(studios):
             studio_queries.append((
@@ -66,38 +102,56 @@ class ResearchTransitiveOpt(Workload):
                  "country": np.random.choice(countries)}
             ))
         yield studio_queries
+        print(f"  ✓ Created {len(studios)} studios in {time.time() - studio_start:.2f}s")
         
         # Batch: Create genres
+        print("\n🎭 GENRES: Creating genres...")
+        genre_start = time.time()
         genre_queries = []
         for genre in genres:
             genre_queries.append(("CREATE (:Genre {name: $name});", {"name": genre}))
         yield genre_queries
+        print(f"  ✓ Created {len(genres)} genres in {time.time() - genre_start:.2f}s")
         
         # Batch: Create languages
+        print("\n🌐 LANGUAGES: Creating languages...")
+        lang_start = time.time()
         lang_queries = []
         for lang in languages:
             lang_queries.append(("CREATE (:Language {code: $code, name: $name});", 
                               {"code": lang, "name": f"Language_{lang}"}))
         yield lang_queries
+        print(f"  ✓ Created {len(languages)} languages in {time.time() - lang_start:.2f}s")
         
         # Batch: Create awards
+        print("\n🏆 AWARDS: Creating awards...")
+        award_start = time.time()
         award_queries = []
         for award in awards:
             award_queries.append(("CREATE (:Award {name: $name, prestige: $prestige});", 
-                                {"name": award, "prestige": int(np.random.randint(1, 100))}))  # ← ALTERADO
+                                {"name": award, "prestige": int(np.random.randint(1, 100))}))
         yield award_queries
+        print(f"  ✓ Created {len(awards)} awards in {time.time() - award_start:.2f}s")
         
-        # Batch: Create people em batches
-        people_per_batch = 4000
+        # Batch: Create people in batches - INCREASED BATCH SIZE
+        people_per_batch = self.BATCH_SIZES['people']
         num_people_batches = int(np.ceil(total_people / people_per_batch))
+        
+        print(f"\n👤 PEOPLE: Creating {total_people:,} people in {num_people_batches} batches of {people_per_batch:,}")
+        print("-" * 60)
 
         top_1_percent = int(0.01 * total_people)
         top_10_percent = int(0.1 * total_people)
 
+        people_start = time.time()
         for batch_num in range(num_people_batches):
+            batch_start_time = time.time()
             people_queries = []
             batch_start = batch_num * people_per_batch
             batch_end = min(batch_start + people_per_batch, total_people)
+            batch_size = batch_end - batch_start
+            
+            print(f"  Batch {batch_num + 1:>3}/{num_people_batches}: People {batch_start:>7,} to {batch_end:>7,} ({batch_size:>5,} people) ", end="", flush=True)
             
             for i in range(batch_start, batch_end):
                 if i < top_1_percent:
@@ -113,19 +167,35 @@ class ResearchTransitiveOpt(Workload):
                      "year": int(np.random.randint(1940, 2000)), "pop": popularity}
                 ))
             yield people_queries
+            
+            batch_time = time.time() - batch_start_time
+            print(f"✓ {batch_time:.2f}s")
+            
+            # Periodic garbage collection for large batches
+            if batch_num % 10 == 0:
+                gc.collect()
         
-        # Batch: Create movies in batches
-        movies_per_batch = 2000
-        total_movies = 8000 * scale
+        print(f"  ✓ Total people creation time: {time.time() - people_start:.2f}s")
+        
+        # Batch: Create movies in batches - INCREASED BATCH SIZE
+        movies_per_batch = self.BATCH_SIZES['movies']
         num_movie_batches = int(np.ceil(total_movies / movies_per_batch))
         
+        print(f"\n🎬 MOVIES: Creating {total_movies:,} movies in {num_movie_batches} batches of {movies_per_batch:,}")
+        print("-" * 60)
+        
         top_1_percent_movies = int(0.01 * total_movies)
-        top_10_percent_movies = int(0.10 * total_movies)  
+        top_10_percent_movies = int(0.10 * total_movies)
 
+        movies_start = time.time()
         for batch_num in range(num_movie_batches):
+            batch_start_time = time.time()
             movie_queries = []
             batch_start = batch_num * movies_per_batch
             batch_end = min(batch_start + movies_per_batch, total_movies)
+            batch_size = batch_end - batch_start
+            
+            print(f"  Batch {batch_num + 1:>3}/{num_movie_batches}: Movies {batch_start:>7,} to {batch_end:>7,} ({batch_size:>5,} movies) ", end="", flush=True)
             
             for i in range(batch_start, batch_end):
                 year = int(np.random.randint(1980, 2023))
@@ -147,15 +217,32 @@ class ResearchTransitiveOpt(Workload):
                      "runtime": int(np.random.randint(70, 210)), "votes": int(np.random.randint(1000, 1000000))}
                 ))
             yield movie_queries
+            
+            batch_time = time.time() - batch_start_time
+            print(f"✓ {batch_time:.2f}s")
+            
+            # Periodic garbage collection
+            if batch_num % 10 == 0:
+                gc.collect()
         
-        # Batch: Cria as conexões entre filmes e outros nós em batches
-        connections_per_batch = 2000
+        print(f"  ✓ Total movies creation time: {time.time() - movies_start:.2f}s")
+        
+        # Batch: Creates the connections between movies and other nodes - INCREASED BATCH SIZE
+        connections_per_batch = self.BATCH_SIZES['connections']
         num_connection_batches = int(np.ceil(total_movies / connections_per_batch))
         
+        print(f"\n🔗 CONNECTIONS: Creating connections for {total_movies:,} movies in {num_connection_batches} batches of {connections_per_batch:,}")
+        print("-" * 60)
+        
+        connections_start = time.time()
         for batch_num in range(num_connection_batches):
+            batch_start_time = time.time()
             connection_queries = []
             batch_start = batch_num * connections_per_batch
             batch_end = min(batch_start + connections_per_batch, total_movies)
+            batch_size = batch_end - batch_start
+            
+            print(f"  Batch {batch_num + 1:>3}/{num_connection_batches}: Movies {batch_start:>7,} to {batch_end:>7,} ({batch_size:>5,} movies) ", end="", flush=True)
             
             for i in range(batch_start, batch_end):
                 studio_weights = np.array([50 if j < 5 else 1 for j in range(50)])
@@ -188,19 +275,34 @@ class ResearchTransitiveOpt(Workload):
                             {"id": i, "award": np.random.choice(awards), "year": award_year}
                         ))
             yield connection_queries
+            
+            batch_time = time.time() - batch_start_time
+            print(f"✓ {batch_time:.2f}s ({len(connection_queries):,} queries)")
+            
+            # Periodic garbage collection
+            if batch_num % 10 == 0:
+                gc.collect()
         
-        # Batch: Create relacionamentos entre pessoas e filmes em batches
-        relationships_per_batch = 250  
-        total_relationships = 100000 * scale
-        num_relationship_batches = int(np.ceil(total_relationships / relationships_per_batch)) 
+        print(f"  ✓ Total connections creation time: {time.time() - connections_start:.2f}s")
+        
+        # Batch: Create relationships - SIGNIFICANTLY INCREASED BATCH SIZE
+        relationships_per_batch = self.BATCH_SIZES['relationships']
+        num_relationship_batches = int(np.ceil(total_relationships / relationships_per_batch))
 
-        print("Generating relationships with memory-efficient streaming...") 
+        print(f"\n🔗 RELATIONSHIPS: Generating {total_relationships:,} relationships")
+        print(f"  • {num_relationship_batches} batches of {relationships_per_batch:,} relationships each")
+        print("-" * 60)
 
+        relationships_start = time.time()
+        role_counts = {"ACTOR": 0, "DIRECTOR": 0, "PRODUCER": 0, "WRITER": 0, "COMPOSER": 0}
+        
         for batch_num in range(num_relationship_batches):
+            batch_start_time = time.time()
             batch_start = batch_num * relationships_per_batch
             batch_end = min(batch_start + relationships_per_batch, total_relationships)
+            batch_size = batch_end - batch_start
 
-            print(f"Batch {batch_num + 1}/{num_relationship_batches} - Relations {batch_start} to {batch_end}")  # ← ADICIONADO
+            print(f"  Batch {batch_num + 1:>3}/{num_relationship_batches}: Relations {batch_start:>7,} to {batch_end:>7,} ({batch_size:>5,} relations) ", end="", flush=True)
 
             role_data = {"ACTOR": [], "DIRECTOR": [], "PRODUCER": [], "WRITER": [], "COMPOSER": []}
             
@@ -210,8 +312,9 @@ class ResearchTransitiveOpt(Workload):
                     p=weights_array/np.sum(weights_array)  
                 ))
                 
-                role_type = np.random.choice(["ACTOR", "DIRECTOR", "PRODUCER", "WRITER", "COMPOSER"])  # ← ALTERADO
-                movie_id = int(np.random.randint(0, 7999 * scale))
+                role_type = np.random.choice(["ACTOR", "DIRECTOR", "PRODUCER", "WRITER", "COMPOSER"])
+                role_counts[role_type] += 1
+                movie_id = int(np.random.randint(0, total_movies - 1))
                 
                 base_salary = {
                     "ACTOR": int(np.random.randint(10000, 5000000)), 
@@ -310,22 +413,42 @@ class ResearchTransitiveOpt(Workload):
             
             yield relationship_queries
             
+            batch_time = time.time() - batch_start_time
+            queries_count = len(relationship_queries)
+            total_relations_in_batch = sum(len(data) for data in role_data.values())
+            print(f"✓ {batch_time:.2f}s ({queries_count} UNWIND queries, {total_relations_in_batch:,} relations)")
+            
+            # Clean up to free memory
             del role_data
             del relationship_queries
 
-            if batch_num % 25 == 0:
+            # More frequent garbage collection for larger batches
+            if batch_num % 5 == 0:
                 gc.collect()
         
-        batch_size = 200
+        print(f"  ✓ Total relationships creation time: {time.time() - relationships_start:.2f}s")
+        
+        # Batch: Create transitive closure - INCREASED BATCH SIZE
         min_collaborations = 2
-
-        print(f"Criando fecho transitivo (mínimo {min_collaborations} filmes)...")
-
-        for batch_num in range(0, total_people, batch_size):
+        transitive_batch_size = self.BATCH_SIZES['transitive']
+        
+        print(f"\n🔄 TRANSITIVE CLOSURE: Creating COLLABORATED_WITH relationships")
+        print(f"  • Minimum collaborations: {min_collaborations}")
+        print(f"  • Batch size: {transitive_batch_size} people per batch")
+        print("-" * 60)
+        
+        transitive_start = time.time()
+        num_transitive_batches = int(np.ceil(total_people / transitive_batch_size))
+        transitive_count = 0
+        
+        for batch_num in range(0, total_people, transitive_batch_size):
+            batch_start_time = time.time()
             start_id = batch_num
-            end_id = min(batch_num + batch_size, total_people)
+            end_id = min(batch_num + transitive_batch_size, total_people)
+            batch_size = end_id - start_id
+            batch_num_display = batch_num // transitive_batch_size + 1
             
-            print(f"Processando pessoas {start_id} a {end_id}...")
+            print(f"  Batch {batch_num_display:>3}/{num_transitive_batches}: People {start_id:>7,} to {end_id:>7,} ({batch_size:>5,} people) ", end="", flush=True)
             
             transitive_queries = [(
                 """MATCH (p1:Person)
@@ -333,7 +456,7 @@ class ResearchTransitiveOpt(Workload):
                 MATCH (p1)-[]->(m:Movie)<-[]-(p2:Person)
                 WHERE p1.id < p2.id
                 WITH p1, p2, COUNT(DISTINCT m) as collaboration_count
-                WHERE collaboration_count >= $min_collaborations  // FILTRO PRÁTICO!
+                WHERE collaboration_count >= $min_collaborations
                 CREATE (p1)-[:COLLABORATED_WITH {
                     movies: collaboration_count,
                     strength: collaboration_count
@@ -341,9 +464,40 @@ class ResearchTransitiveOpt(Workload):
                 {"start": start_id, "end": end_id, "min_collaborations": min_collaborations}
             )]
             yield transitive_queries
+            
+            batch_time = time.time() - batch_start_time
+            transitive_count += 1
+            print(f"✓ {batch_time:.2f}s")
+            
+            # Garbage collection for transitive closure batches
+            if batch_num_display % 10 == 0:
+                gc.collect()
+        
+        print(f"  ✓ Total transitive closure time: {time.time() - transitive_start:.2f}s")
+        print(f"  ✓ Created {transitive_count} transitive batches")
+
+        # Final summary
+        total_time = time.time() - start_time
+        print("\n" + "="*80)
+        print("✅ DATASET GENERATION COMPLETE")
+        print("="*80)
+        print(f"  • Total time: {total_time:.2f}s")
+        print(f"  • People: {total_people:,}")
+        print(f"  • Movies: {total_movies:,}")
+        print(f"  • Relationships: {total_relationships:,}")
+        print(f"  • Transitive batches: {transitive_count}")
+        print(f"  • Minimum collaborations: {min_collaborations}")
+        print(f"\n📊 Relationship breakdown:")
+        print(f"  • ACTOR: {role_counts['ACTOR']:,}")
+        print(f"  • DIRECTOR: {role_counts['DIRECTOR']:,}")
+        print(f"  • PRODUCER: {role_counts['PRODUCER']:,}")
+        print(f"  • WRITER: {role_counts['WRITER']:,}")
+        print(f"  • COMPOSER: {role_counts['COMPOSER']:,}")
+        print("="*80 + "\n")
 
     def benchmark__test__strong_collaboration_clusters(self):
         """COM FECHO: Encontra clusters de colaboração forte"""
+        print("\n🔍 Running: Strong Collaboration Clusters (with transitive closure)")
         return ("""
         // Como TODAS as COLLABORATED_WITH são fortes (>= 2 filmes),
         // podemos buscar triângulos diretamente
@@ -364,6 +518,11 @@ class ResearchTransitiveOpt(Workload):
         target_genres = ["Action", "Drama"]
         min_year = 2008
         min_rating = 7.2
+        
+        print("\n🔍 Running: Complex Categorical Analytics")
+        print(f"  • target_genres: {target_genres}")
+        print(f"  • min_year: {min_year}")
+        print(f"  • min_rating: {min_rating}")
         
         return ("""
         // Complex multi-category business intelligence query
@@ -389,6 +548,7 @@ class ResearchTransitiveOpt(Workload):
     
     def benchmark__test__cross_role_workforce_analysis(self):
         """Role-agnostic workforce analytics - INEFFICIENT with multiple relationship types"""
+        print("\n🔍 Running: Cross-Role Workforce Analysis")
         return ("""
         // Analyze entire workforce across all roles - requires UNION
         MATCH (p:Person)-[r:ACTED_IN]->(m:Movie)
@@ -411,7 +571,11 @@ class ResearchTransitiveOpt(Workload):
         
     def benchmark__test__relationship_property_mining(self):
         """Complex relationship property analysis - INEFFICIENT without indexing"""
-        min_salary = 1500000 
+        min_salary = 1500000
+        
+        print("\n🔍 Running: Relationship Property Mining")
+        print(f"  • min_salary: ${min_salary:,}")
+        
         return ("""
         // Find high-paid lead actors and analyze their career patterns
         MATCH (p:Person)-[r:ACTED_IN]->(m:Movie)
@@ -434,6 +598,10 @@ class ResearchTransitiveOpt(Workload):
     def benchmark__test__workforce_salary_analytics(self):
         """Analytics salariais da força de trabalho - SEM índices em relationships"""
         min_salary = 1000000
+        
+        print("\n🔍 Running: Workforce Salary Analytics")
+        print(f"  • min_salary: ${min_salary:,}")
+        
         return ("""
         // Analytics complexas sem índices - requer scan
         MATCH (p:Person)-[r]->(m:Movie)
@@ -451,6 +619,7 @@ class ResearchTransitiveOpt(Workload):
     
     def benchmark__test__denormalized_genre_performance(self):
         """VERSÃO NORMALIZADA - Query equivalente mas sem desnormalização"""
+        print("\n🔍 Running: Denormalized Genre Performance (Normalized version)")
         return ("""
         // VERSÃO NORMALIZADA - Requer cálculo em tempo real
         MATCH (g:Genre)<-[:HAS_GENRE]-(m:Movie)
@@ -467,6 +636,7 @@ class ResearchTransitiveOpt(Workload):
     
     def benchmark__test__complex_country_network_base(self):
         """BASE VERSION - Complex country-based network analysis using property scans"""
+        print("\n🔍 Running: Complex Country Network Base")
         return ("""
         // Find countries with strong domestic collaboration networks
         MATCH (p1:Person)-[:ACTED_IN]->(m:Movie)<-[:ACTED_IN]-(p2:Person)
