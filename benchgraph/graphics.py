@@ -603,7 +603,8 @@ if __name__ == "__main__":
             'variant_small_file_neo4j': 'results_research_uplift_opt_neo4j_small.json',
             'variant_large_file_neo4j': 'results_research_uplift_opt_neo4j_large.json',
             'variant_small_file_memgraph': 'results_research_uplift_opt_memgraph_small.json',
-            'variant_large_file_memgraph': 'results_research_uplift_opt_memgraph_large.json'
+            'variant_large_file_memgraph': 'results_research_uplift_opt_memgraph_large.json',
+            'variant_extra_file': 'results_research_uplift_opt_neo4j_extra.json'
         },
         {
             'variant_name': 'Denormalized',
