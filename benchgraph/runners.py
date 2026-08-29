@@ -941,13 +941,19 @@ class MemgraphDocker(BaseRunner):
         self._container_name = "memgraph_benchmark"
         self._container_ip = None
         self._config_file = None
+        self._is_running = False
         _setup_docker_benchmark_network(network_name=DOCKER_NETWORK_NAME)
 
     def _set_args(self, **kwargs):
         return _convert_args_to_flags(**kwargs)
 
     def start_db_init(self, message):
+        """Start database for import. Container stays running."""
         log.init("Starting database for import...")
+        
+        # Clean up any existing container first
+        self.clean_db()
+        
         try:
             command = [
                 "docker", "run",
@@ -956,309 +962,240 @@ class MemgraphDocker(BaseRunner):
                 "--name", self._container_name,
                 "-it",
                 "-p", self._bolt_port + ":" + self._bolt_port,
-                "--memory=20g",          # 20GB RAM
-                "--memory-swap=25g",     # 5GB swap allowed (total 25GB)
-                "--shm-size=2g",         # Shared memory
+                "--memory=24g",              # 24GB for the container (leaves 4GB for WSL)
+                "--memory-swap=32g",         # Allow 26GB with swap
+                "--shm-size=4g",             # Shared memory
                 "memgraph/memgraph:3.12.0",
                 "--storage-wal-enabled=false",
                 "--data-recovery-on-startup=true",
                 "--storage-snapshot-interval-sec=0",
                 "--storage-snapshot-on-exit=true",
                 "--storage-properties-on-edges=true",
-                "--memory-limit=20480",  # 20GB in MB
+                "--storage-mode=IN_MEMORY_ANALYTICAL",  # CRITICAL - reduces memory usage
+                "--memory-limit=32000",      # 32GB internal limit
             ]
             command.extend(self._set_args(**self._vendor_args))
             ret = self._run_command(command)
+            
+            # Copy config file for potential modifications
+            try:
+                command = [
+                    "docker",
+                    "cp",
+                    self._container_name + ":/etc/memgraph/memgraph.conf",
+                    self._directory.name + "/memgraph.conf",
+                ]
+                self._run_command(command)
+                self._config_file = Path(self._directory.name + "/memgraph.conf")
+            except Exception as e:
+                log.warning(f"Could not copy config file: {e}")
+            
+            # Wait for the server socket to be ready
+            _wait_for_server_socket(self._bolt_port, delay=0.5)
+            self._is_running = True
+            log.log("Database started for import.")
+            
         except subprocess.CalledProcessError as e:
             log.error("Failed to start Memgraph docker container.")
-            log.error(
-                "There is probably a database running on that port, please stop the running container and try again."
-            )
+            log.error(e.stderr)
             raise e
 
-        command = [
-            "docker",
-            "cp",
-            self._container_name + ":/etc/memgraph/memgraph.conf",
-            self._directory.name + "/memgraph.conf",
-        ]
-        self._run_command(command)
-        self._config_file = Path(self._directory.name + "/memgraph.conf")
-        _wait_for_server_socket(self._bolt_port, delay=0.5)
-        log.log("Database started.")
-
     def stop_db_init(self, message):
-        log.init("Stopping database...")
+        """
+        Called after import completes.
+        CRITICAL FIX: We DO NOT stop the container.
+        We keep it running to preserve the data in memory.
+        """
+        log.init("Import complete. Keeping database running for benchmarks...")
+        
+        # Get current usage for reporting
         usage = self._get_cpu_memory_usage()
-
-        # Stop to save the snapshot
-        command = ["docker", "stop", self._container_name]
-        self._run_command(command)
-
-        # Change config back to default
-        argument = "--storage-snapshot-on-exit=false"
-        self._replace_config_args(argument)
-        command = [
-            "docker",
-            "cp",
-            self._config_file.resolve(),
-            self._container_name + ":/etc/memgraph/memgraph.conf",
-        ]
-        self._run_command(command)
-        log.log("Database stopped.")
+        
+        # Optional: Force a snapshot (but not required)
+        try:
+            log.log("Saving snapshot before benchmarks...")
+            mgconsole_cmd = [
+                "docker", "exec", self._container_name,
+                "mgconsole", "--query", "STORAGE SNAPSHOT;"
+            ]
+            self._run_command(mgconsole_cmd, timeout=30, check=False)
+        except Exception as e:
+            log.warning(f"Could not force snapshot: {e}")
+        
+        # Container stays running - data is preserved!
+        self._is_running = True
+        log.log("Database is running with imported data ready for benchmarks")
+        
         return usage
 
     def start_db(self, message):
-        log.init("Starting database for benchmark...")
-        command = ["docker", "start", self._container_name]
-        print("Starting container with command: {}".format(" ".join(command)))
+        """
+        Called before each benchmark query.
+        Container is already running, we just verify it's ready.
+        """
+        log.init("Preparing database for benchmark...")
         
+        # Check if container is running
         try:
-            self._run_command(command, timeout=60, max_retries=3)
+            check_cmd = ["docker", "inspect", "-f", "{{.State.Running}}", self._container_name]
+            result = self._run_command(check_cmd, timeout=5, max_retries=1, check=False)
+            
+            if not result or result.stdout.strip() != "true":
+                log.warning("Container is not running, starting it...")
+                command = ["docker", "start", self._container_name]
+                self._run_command(command, timeout=60, max_retries=3)
+                _wait_for_server_socket(self._bolt_port, delay=2.0)
+            else:
+                log.log("Container is already running")
+                
         except Exception as e:
-            log.error(f"Failed to start container: {e}")
-            # Try to recreate if start fails
-            log.info("Attempting to recreate container...")
-            self.clean_db()
-            self.start_db_init(message)
-            # Try starting again
+            log.warning(f"Could not check container status: {e}")
+            # Try to start it anyway
+            command = ["docker", "start", self._container_name]
             self._run_command(command, timeout=60, max_retries=3)
+            _wait_for_server_socket(self._bolt_port, delay=2.0)
         
-        time.sleep(3)
-        _wait_for_server_socket(self._bolt_port, delay=0.5)
-        log.log("Database started.")
+        # Wait a bit for the database to be ready
+        time.sleep(2)
+        
+        self._is_running = True
+        log.log("Database ready for benchmarks.")
 
     def stop_db(self, message):
-        log.init("Stopping database...")
+        """
+        Called AFTER each benchmark query execution.
+        CRITICAL FIX: We DO NOT stop the container.
+        """
+        log.init("Benchmark query complete. Keeping database running...")
+        
+        # Get usage for reporting
         usage = self._get_cpu_memory_usage()
-        command = ["docker", "stop", self._container_name]
-        self._run_command(command)
-        log.log("Database stopped.")
+        
+        # Container stays running - data persists for next query!
+        self._is_running = True
+        
         return usage
 
     def clean_db(self):
-        self.remove_container(self._container_name)
+        """Clean up the container at the very end."""
+        log.init("Cleaning up database container...")
+        
+        try:
+            # Check if container exists
+            check_cmd = ["docker", "ps", "-a", "--filter", f"name={self._container_name}", "--format", "{{.Names}}"]
+            result = self._run_command(check_cmd, timeout=5, max_retries=1, check=False)
+            
+            if result and self._container_name in result.stdout:
+                # Stop the container first
+                stop_cmd = ["docker", "stop", self._container_name]
+                self._run_command(stop_cmd, timeout=30, max_retries=2, check=False)
+                
+                # Remove the container
+                rm_cmd = ["docker", "rm", "-f", self._container_name]
+                self._run_command(rm_cmd, timeout=10, max_retries=2, check=False)
+                log.log(f"Container {self._container_name} removed")
+            else:
+                log.log(f"Container {self._container_name} does not exist")
+                
+        except Exception as e:
+            log.warning(f"Error during cleanup: {e}")
+        
+        self._is_running = False
 
     def fetch_client(self) -> BaseClient:
         return BoltClientDocker(benchmark_context=self.benchmark_context)
 
     def remove_container(self, containerName):
-        command = ["docker", "rm", "-f", containerName]
-        self._run_command(command)
+        """Alias for clean_db."""
+        self.clean_db()
 
     def _replace_config_args(self, argument):
-        config_lines = []
-        with self._config_file.open("r") as file:
-            lines = file.readlines()
-            file.close()
-            key, value = argument.split("=")
-            for line in lines:
-                if line[0] == "#" or line.strip("\n") == "":
-                    config_lines.append(line)
-                else:
-                    key_file, value_file = line.split("=")
-                    if key_file == key and value != value_file:
-                        line = argument + "\n"
-                    config_lines.append(line)
+        """Replace or add config arguments."""
+        if not self._config_file or not self._config_file.exists():
+            log.warning("Config file not available, skipping replacement")
+            return
+            
+        try:
+            config_lines = []
+            with self._config_file.open("r") as file:
+                lines = file.readlines()
+                file.close()
+                key, value = argument.split("=")
+                found = False
+                for line in lines:
+                    if line[0] == "#" or line.strip("\n") == "":
+                        config_lines.append(line)
+                    else:
+                        try:
+                            key_file, value_file = line.split("=")
+                            if key_file == key:
+                                line = argument + "\n"
+                                found = True
+                        except:
+                            pass
+                        config_lines.append(line)
+                
+                if not found:
+                    config_lines.append(argument + "\n")
 
-        with self._config_file.open("w") as file:
-            file.writelines(config_lines)
-            file.close()
+            with self._config_file.open("w") as file:
+                file.writelines(config_lines)
+                file.close()
+        except Exception as e:
+            log.warning(f"Could not replace config args: {e}")
 
     def _get_cpu_memory_usage(self):
-        """Get CPU and memory usage from the Docker container with timeouts and retries."""
+        """Get CPU and memory usage from the Docker container."""
         usage = {"cpu": 0, "memory": 0}
         
-        # First check if container is running
-        check_cmd = ["docker", "inspect", "-f", "{{.State.Running}}", self._container_name]
+        # Check if container is running
         try:
-            ret = self._run_command(check_cmd, timeout=5, max_retries=1)
-            if ret.stdout.strip() != "true":
-                log.warning(f"Container {self._container_name} is not running")
+            check_cmd = ["docker", "inspect", "-f", "{{.State.Running}}", self._container_name]
+            ret = self._run_command(check_cmd, timeout=5, max_retries=1, check=False)
+            if not ret or ret.stdout.strip() != "true":
                 return usage
-        except Exception as e:
-            log.warning(f"Could not inspect container {self._container_name}: {e}")
+        except Exception:
             return usage
         
-        # Get memory usage - try multiple methods
-        memory_kb = 0
-        
-        # Method 1: Using docker stats (most reliable)
+        # Get memory usage
         try:
             stats_cmd = [
                 "docker", "stats", "--no-stream", "--format", 
                 "{{.MemUsage}}", self._container_name
             ]
-            ret = self._run_command(stats_cmd, timeout=5, max_retries=1)
-            if ret.stdout.strip():
-                # Output format: "1.234GiB / 2GiB" or "256MiB / 512MiB"
-                mem_str = ret.stdout.strip().split()[0]  # Take only the used part
+            ret = self._run_command(stats_cmd, timeout=5, max_retries=1, check=False)
+            if ret and ret.stdout.strip():
+                mem_str = ret.stdout.strip().split()[0]
                 memory_kb = self._parse_memory_string(mem_str)
-                log.log(f"Memory usage via docker stats: {memory_kb} KB")
+                usage["memory"] = memory_kb * 1024
         except Exception as e:
-            log.warning(f"Failed to get memory via docker stats: {e}")
-        
-        # Method 2: Try to get from /proc/1/status inside container
-        if memory_kb == 0:
-            try:
-                # Check if container is running first
-                ps_cmd = ["docker", "ps", "-q", "-f", f"name={self._container_name}"]
-                ps_ret = self._run_command(ps_cmd, timeout=5, max_retries=1)
-                if not ps_ret.stdout.strip():
-                    log.warning(f"Container {self._container_name} not running")
-                    return usage
-                
-                # Try to get the actual PID of the main process
-                pid_cmd = [
-                    "docker", "exec", self._container_name,
-                    "sh", "-c", "ps aux | grep -v grep | grep memgraph | awk '{print $1}' | head -1"
-                ]
-                pid_ret = self._run_command(pid_cmd, timeout=5, max_retries=1, check=False)
-                
-                # If we can't find memgraph process, try PID 1
-                pid = pid_ret.stdout.strip() if pid_ret.stdout.strip() else "1"
-                
-                memory_cmd = [
-                    "docker", "exec", self._container_name,
-                    "sh", "-c", f"grep ^VmRSS /proc/{pid}/status 2>/dev/null || grep ^VmPeak /proc/{pid}/status 2>/dev/null || echo '0'"
-                ]
-                ret = self._run_command(memory_cmd, timeout=5, max_retries=1, check=False)
-                
-                if ret.stdout.strip():
-                    parts = ret.stdout.strip().split()
-                    if len(parts) >= 2 and parts[1].isdigit():
-                        memory_kb = int(parts[1])
-                        log.log(f"Memory usage via /proc: {memory_kb} KB")
-            except Exception as e:
-                log.warning(f"Failed to get memory via /proc: {e}")
-        
-        # Method 3: Try docker inspect to get PID and read from host /proc
-        if memory_kb == 0:
-            try:
-                inspect_cmd = [
-                    "docker", "inspect", 
-                    "-f", "{{.State.Pid}}", 
-                    self._container_name
-                ]
-                ret = self._run_command(inspect_cmd, timeout=5, max_retries=1)
-                if ret.stdout.strip():
-                    pid = ret.stdout.strip()
-                    # Try to read memory from host's /proc for the container's PID
-                    try:
-                        with open(f"/proc/{pid}/status") as f:
-                            for line in f:
-                                if line.startswith("VmRSS:"):
-                                    parts = line.split()
-                                    if len(parts) >= 2 and parts[1].isdigit():
-                                        memory_kb = int(parts[1])
-                                        log.log(f"Memory usage via host /proc: {memory_kb} KB")
-                                        break
-                    except (FileNotFoundError, PermissionError) as e:
-                        log.warning(f"Could not read /proc/{pid}/status: {e}")
-            except Exception as e:
-                log.warning(f"Failed to get memory via inspect: {e}")
-        
-        # Method 4: Try docker top to get memory
-        if memory_kb == 0:
-            try:
-                top_cmd = ["docker", "top", self._container_name, "-o", "rss"]
-                ret = self._run_command(top_cmd, timeout=5, max_retries=1)
-                if ret.stdout.strip():
-                    lines = ret.stdout.strip().split('\n')
-                    if len(lines) > 1:
-                        # Sum RSS from all processes
-                        total_rss_kb = 0
-                        for line in lines[1:]:  # Skip header
-                            parts = line.strip().split()
-                            if len(parts) > 0 and parts[0].isdigit():
-                                total_rss_kb += int(parts[0])
-                        if total_rss_kb > 0:
-                            memory_kb = total_rss_kb
-                            log.log(f"Memory usage via docker top: {memory_kb} KB")
-            except Exception as e:
-                log.warning(f"Failed to get memory via docker top: {e}")
-        
-        # Method 5: Try docker system df for container size (last resort)
-        if memory_kb == 0:
-            try:
-                # Get container size
-                size_cmd = ["docker", "inspect", "-f", "{{.SizeRw}}", self._container_name]
-                ret = self._run_command(size_cmd, timeout=5, max_retries=1)
-                if ret.stdout.strip() and ret.stdout.strip().isdigit():
-                    memory_kb = int(ret.stdout.strip()) / 1024  # Convert bytes to KB
-                    log.log(f"Memory usage via container size: {memory_kb} KB")
-            except Exception as e:
-                log.warning(f"Failed to get memory via container size: {e}")
-        
-        usage["memory"] = memory_kb * 1024  # Convert KB to bytes
+            log.warning(f"Failed to get memory usage: {e}")
         
         # Get CPU usage
-        cpu_seconds = 0
         try:
-            # Method 1: Try docker stats for CPU
             stats_cmd = [
                 "docker", "stats", "--no-stream", "--format", 
                 "{{.CPUPerc}}", self._container_name
             ]
-            ret = self._run_command(stats_cmd, timeout=5, max_retries=1)
-            if ret.stdout.strip():
-                # Parse percentage
+            ret = self._run_command(stats_cmd, timeout=5, max_retries=1, check=False)
+            if ret and ret.stdout.strip():
                 cpu_str = ret.stdout.strip().replace('%', '')
                 cpu_percent = float(cpu_str)
                 
-                # Convert percentage to approximate seconds
                 inspect_cmd = [
                     "docker", "inspect", 
                     "-f", "{{.State.StartedAt}}", 
                     self._container_name
                 ]
-                ret = self._run_command(inspect_cmd, timeout=5, max_retries=1)
-                if ret.stdout.strip():
+                ret = self._run_command(inspect_cmd, timeout=5, max_retries=1, check=False)
+                if ret and ret.stdout.strip():
                     from datetime import datetime
                     start_time = datetime.fromisoformat(ret.stdout.strip().replace('Z', '+00:00'))
                     elapsed_seconds = (datetime.now().astimezone() - start_time).total_seconds()
-                    # CPU seconds = CPU percentage * elapsed_seconds / 100
-                    cpu_seconds = (cpu_percent * elapsed_seconds) / 100
-                    log.log(f"CPU usage: {cpu_percent}% over {elapsed_seconds:.1f}s = {cpu_seconds:.2f}s")
+                    usage["cpu"] = (cpu_percent * elapsed_seconds) / 100
         except Exception as e:
-            log.warning(f"Failed to get CPU via docker stats: {e}")
+            log.warning(f"Failed to get CPU usage: {e}")
         
-        # Method 2: Try docker top for CPU (alternative)
-        if cpu_seconds == 0:
-            try:
-                top_cmd = ["docker", "top", self._container_name, "-o", "pcpu"]
-                ret = self._run_command(top_cmd, timeout=5, max_retries=1)
-                if ret.stdout.strip():
-                    lines = ret.stdout.strip().split('\n')
-                    if len(lines) > 1:
-                        # Sum CPU percentages from all processes
-                        total_cpu_percent = 0.0
-                        for line in lines[1:]:  # Skip header
-                            parts = line.strip().split()
-                            if len(parts) > 0:
-                                try:
-                                    total_cpu_percent += float(parts[0])
-                                except ValueError:
-                                    pass
-                        
-                        if total_cpu_percent > 0:
-                            # Convert to seconds (rough estimate)
-                            inspect_cmd = [
-                                "docker", "inspect", 
-                                "-f", "{{.State.StartedAt}}", 
-                                self._container_name
-                            ]
-                            ret = self._run_command(inspect_cmd, timeout=5, max_retries=1)
-                            if ret.stdout.strip():
-                                from datetime import datetime
-                                start_time = datetime.fromisoformat(ret.stdout.strip().replace('Z', '+00:00'))
-                                elapsed_seconds = (datetime.now().astimezone() - start_time).total_seconds()
-                                cpu_seconds = (total_cpu_percent * elapsed_seconds) / 100
-                                log.log(f"CPU usage via docker top: {cpu_seconds:.2f}s")
-            except Exception as e:
-                log.warning(f"Failed to get CPU via docker top: {e}")
-        
-        usage["cpu"] = cpu_seconds
         return usage
 
     def _parse_memory_string(self, mem_str):
@@ -1267,7 +1204,6 @@ class MemgraphDocker(BaseRunner):
         if not mem_str:
             return 0
         
-        # Extract number and unit
         import re
         match = re.match(r'([\d.]+)([a-zA-Z]+)', mem_str)
         if not match:
@@ -1277,36 +1213,25 @@ class MemgraphDocker(BaseRunner):
         unit = match.group(2).lower()
         
         # Convert to KB
-        if unit == 'b':
+        if unit in ['b']:
             return int(value / 1024)
-        elif unit == 'kb':
+        elif unit in ['kb', 'kib']:
             return int(value)
-        elif unit == 'mb':
+        elif unit in ['mb', 'mib']:
             return int(value * 1024)
-        elif unit == 'gb':
+        elif unit in ['gb', 'gib']:
             return int(value * 1024 * 1024)
-        elif unit == 'tb':
-            return int(value * 1024 * 1024 * 1024)
-        elif unit == 'kib':
-            return int(value)
-        elif unit == 'mib':
-            return int(value * 1024)
-        elif unit == 'gib':
-            return int(value * 1024 * 1024)
-        elif unit == 'tib':
+        elif unit in ['tb', 'tib']:
             return int(value * 1024 * 1024 * 1024)
         else:
             return 0
             
-    def _run_command(self, command, timeout=30, max_retries=3, retry_delay=2.0):
+    def _run_command(self, command, timeout=30, max_retries=3, retry_delay=2.0, check=True):
         """Run a command with retry logic and timeout."""
         last_exception = None
         
         for attempt in range(max_retries):
             try:
-                cmd_str = ' '.join(str(c) for c in command[:3]) + '...'
-                log.log(f"Running command (attempt {attempt+1}/{max_retries}): {cmd_str}")
-                
                 str_command = [str(c) for c in command]
                 
                 # Run with timeout
@@ -1318,91 +1243,45 @@ class MemgraphDocker(BaseRunner):
                     check=False
                 )
                 
-                # Small yield to kernel after each command
                 time.sleep(0.05)
                 
                 if ret.returncode == 0:
                     return ret
                 else:
                     error_msg = ret.stderr.strip() if ret.stderr else f"Return code: {ret.returncode}"
-                    log.warning(f"Command failed with return code {ret.returncode}: {error_msg}")
+                    log.warning(f"Command failed (attempt {attempt+1}/{max_retries}): {error_msg}")
                     
-                    # Check if this is a recoverable error
-                    recoverable = [
-                        "connection refused",
-                        "cannot connect", 
-                        "timeout",
-                        "broken pipe",
-                        "resource temporarily unavailable",
-                        "no such container",
-                        "container not running"
-                    ]
-                    
-                    is_recoverable = any(err in error_msg.lower() for err in recoverable)
-                    
-                    if is_recoverable:
-                        last_exception = subprocess.CalledProcessError(ret.returncode, command, ret.stdout, ret.stderr)
-                        
-                        if attempt < max_retries - 1:
-                            wait_time = retry_delay * (attempt + 1)
-                            log.info(f"Retrying in {wait_time} seconds...")
-                            time.sleep(wait_time)
-                            continue
-                        else:
-                            raise last_exception
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (attempt + 1)
+                        time.sleep(wait_time)
+                        continue
                     else:
+                        if not check:
+                            return ret
                         raise subprocess.CalledProcessError(ret.returncode, command, ret.stdout, ret.stderr)
                         
             except subprocess.TimeoutExpired as e:
-                log.warning(f"Command timed out after {timeout} seconds (attempt {attempt+1}/{max_retries})")
+                log.warning(f"Command timed out (attempt {attempt+1}/{max_retries})")
                 last_exception = e
                 
                 if attempt < max_retries - 1:
-                    # Try to clean up hanging docker processes
-                    try:
-                        str_command = [str(c) for c in command]
-                        if len(str_command) > 0 and "docker" in str_command[0] and "start" in str_command:
-                            container_name = str_command[-1] if str_command[-1] != "-i" else str_command[-2]
-                            kill_cmd = ["docker", "kill", container_name]
-                            subprocess.run(kill_cmd, capture_output=True, timeout=2, check=False)
-                    except:
-                        pass
-                    
                     wait_time = retry_delay * (attempt + 1)
-                    log.info(f"Retrying in {wait_time} seconds...")
                     time.sleep(wait_time)
                     continue
                 else:
-                    cmd_str = ' '.join(str(c) for c in command)
-                    raise TimeoutError(f"Command timed out after {max_retries} attempts: {cmd_str}")
+                    raise TimeoutError(f"Command timed out after {max_retries} attempts")
                     
-            except subprocess.CalledProcessError as e:
-                last_exception = e
-                if attempt < max_retries - 1:
-                    error_msg = str(e.stderr) if e.stderr else str(e)
-                    recoverable = ["connection refused", "cannot connect", "timeout"]
-                    if any(err in error_msg.lower() for err in recoverable):
-                        wait_time = retry_delay * (attempt + 1)
-                        log.info(f"Recoverable error, retrying in {wait_time} seconds...")
-                        time.sleep(wait_time)
-                        continue
-                log.error(f"Command failed after {attempt+1} attempts: {e}")
-                raise
-            
             except Exception as e:
-                log.error(f"Unexpected error in _run_command: {e}")
+                log.error(f"Command error: {e}")
                 if attempt < max_retries - 1:
-                    wait_time = retry_delay * (attempt + 1)
-                    time.sleep(wait_time)
+                    time.sleep(retry_delay * (attempt + 1))
                     continue
                 raise
         
         if last_exception:
             raise last_exception
         else:
-            cmd_str = ' '.join(str(c) for c in command)
-            raise Exception(f"Command failed for unknown reason: {cmd_str}")
-
+            raise Exception("Command failed for unknown reason")           
 class Neo4jDocker(BaseRunner):
     def __init__(self, benchmark_context: BenchmarkContext):
         super().__init__(benchmark_context=benchmark_context)
